@@ -1,0 +1,11 @@
+{
+  "name": "beads",
+  "label": "Beads",
+  "description": "Read-only Beads project overview and issue browser.",
+  "version": "1.0.0",
+  "api": "plugin_api.py",
+  "entry": "index.js",
+  "tab": {
+    "hidden": true
+  }
+}
