@@ -17,6 +17,9 @@ import plugin, {
   ProjectPane,
   queryEnablement,
   retentionReducer,
+  lookupProjectForCwd,
+  resolveProjectPath,
+  selectProjectForCwd,
   selectRequestedRoot
 } from '../desktop/plugin.js'
 import { __queryOptions, __setQueryResult, queryClient } from '@hermes/plugin-sdk'
@@ -48,6 +51,81 @@ test('selectRequestedRoot chooses the longest absolute ancestor', () => {
   assert.equal(isPathAncestor('/a/b', '/a/bc'), false)
   assert.equal(pathsEquivalent('/project/.', '/project/'), true)
   assert.equal(pathsEquivalent('/project', '/project-other'), false)
+})
+
+test('resolveProjectPath supports one unambiguous tilde path without widening path acceptance', () => {
+  const cwd = '/home/hermes/workspace/projects/Hugo/mitado.ch'
+  assert.equal(resolveProjectPath('/home/hermes/workspace', cwd), '/home/hermes/workspace')
+  assert.equal(resolveProjectPath('~/workspace/projects/Hugo/mitado.ch', cwd), cwd)
+  assert.equal(resolveProjectPath('~/workspace/projects/Hugo', cwd), '/home/hermes/workspace/projects/Hugo')
+  assert.equal(resolveProjectPath('~/other', cwd), null)
+  assert.equal(resolveProjectPath('relative/project', cwd), null)
+  assert.equal(resolveProjectPath('~', cwd), null)
+  assert.equal(resolveProjectPath('~/', cwd), null)
+  assert.equal(resolveProjectPath('~/workspace/', cwd), null)
+  assert.equal(resolveProjectPath('~/workspace//projects', cwd), null)
+  assert.equal(resolveProjectPath('~/workspace/./projects', cwd), null)
+  assert.equal(resolveProjectPath('~/workspace/../projects', cwd), null)
+  assert.equal(resolveProjectPath('~other/workspace', cwd), null)
+  assert.equal(resolveProjectPath('~/workspace\\projects', cwd), null)
+  assert.equal(resolveProjectPath('~/workspace', '/home/hermes/workspace/projects/workspace/child'), null)
+  assert.equal(resolveProjectPath('~/workspace', 'relative/cwd'), null)
+})
+
+test('selectProjectForCwd chooses the longest active absolute or tilde root', () => {
+  const cwd = '/home/hermes/workspace/app/packages/api/src'
+  const project = selectProjectForCwd([
+    { id: 'archived-deep', archived: true, primary_path: '/home/hermes/workspace/app/packages/api', folders: [] },
+    { id: 'broad', archived: false, primary_path: '~/workspace', folders: [] },
+    { id: 'nested', archived: false, primary_path: '~/workspace/app', folders: [{ path: '~/workspace/app/packages/api' }] }
+  ], cwd)
+  assert.equal(project?.id, 'nested')
+})
+
+test('lookupProjectForCwd preserves a normal project response without listing', async () => {
+  const calls = []
+  const response = {
+    project: { id: 'project', primary_path: '/home/hermes/workspace' },
+    cwd: '/home/hermes/workspace/app',
+    branch: 'main'
+  }
+  const result = await lookupProjectForCwd(async (method, params) => {
+    calls.push([method, params])
+    return response
+  }, '/home/hermes/workspace/app', 'developer')
+  assert.equal(result, response)
+  assert.deepEqual(calls, [['projects.for_cwd', { cwd: '/home/hermes/workspace/app', profile: 'developer' }]])
+})
+
+test('lookupProjectForCwd falls back to projects.list for tilde roots and preserves cwd and branch', async () => {
+  const calls = []
+  const response = { project: null, cwd: '/home/hermes/workspace/projects/Hugo/mitado.ch', branch: 'main' }
+  const result = await lookupProjectForCwd(async (method, params) => {
+    calls.push([method, params])
+    if (method === 'projects.for_cwd') return response
+    return {
+      projects: [
+        { id: 'archived', archived: true, primary_path: '/home/hermes/workspace/projects/Hugo', folders: [] },
+        { id: 'mitado', archived: false, primary_path: '~/workspace/projects/Hugo/mitado.ch', folders: [] }
+      ],
+      active_id: 'mitado'
+    }
+  }, response.cwd, 'developer')
+  assert.equal(result.cwd, response.cwd)
+  assert.equal(result.branch, response.branch)
+  assert.equal(result.project.id, 'mitado')
+  assert.deepEqual(calls, [
+    ['projects.for_cwd', { cwd: response.cwd, profile: 'developer' }],
+    ['projects.list', { profile: 'developer' }]
+  ])
+})
+
+test('lookupProjectForCwd keeps the original no-project response when fallback data is invalid', async () => {
+  const response = { project: null, cwd: '/home/hermes/workspace/project', branch: '' }
+  for (const listResult of [{ projects: null }, Promise.reject(new Error('list unavailable'))]) {
+    const result = await lookupProjectForCwd(async method => method === 'projects.for_cwd' ? response : await listResult, response.cwd, 'developer')
+    assert.equal(result, response)
+  }
 })
 
 test('query keys include connection profile requested root canonical root view and issue', () => {

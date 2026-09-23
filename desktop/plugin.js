@@ -45,6 +45,27 @@ export function normalizeAbsolutePath(value) {
   return `/${parts.join('/')}`
 }
 
+export function resolveProjectPath(value, resolvedCwd) {
+  if (typeof value !== 'string') return null
+  const candidate = value.trim()
+  if (candidate.startsWith('/')) return normalizeAbsolutePath(candidate)
+  if (!candidate.startsWith('~/') || candidate.includes('\\')) return null
+
+  const suffix = candidate.slice(2).split('/')
+  if (suffix.some(part => !part || part === '.' || part === '..')) return null
+
+  const cwd = normalizeAbsolutePath(resolvedCwd)
+  if (!cwd) return null
+  const cwdParts = cwd.split('/').filter(Boolean)
+  const matches = []
+  for (let index = 0; index + suffix.length <= cwdParts.length; index += 1) {
+    if (suffix.every((part, offset) => cwdParts[index + offset] === part)) {
+      matches.push(`/${cwdParts.slice(0, index + suffix.length).join('/')}`)
+    }
+  }
+  return matches.length === 1 ? matches[0] : null
+}
+
 export function isPathAncestor(ancestor, child) {
   const parent = normalizeAbsolutePath(ancestor)
   const target = normalizeAbsolutePath(child)
@@ -68,10 +89,19 @@ export function selectRequestedRoot(project, resolvedCwd) {
     }
   }
   return candidates
-    .map(normalizeAbsolutePath)
+    .map(candidate => resolveProjectPath(candidate, resolvedCwd))
     .filter(Boolean)
     .filter(candidate => isPathAncestor(candidate, resolvedCwd))
     .sort((left, right) => right.length - left.length)[0] || null
+}
+
+export function selectProjectForCwd(projects, resolvedCwd) {
+  if (!Array.isArray(projects)) return null
+  return projects
+    .filter(project => project && !project.archived)
+    .map(project => ({ project, root: selectRequestedRoot(project, resolvedCwd) }))
+    .filter(entry => entry.root)
+    .sort((left, right) => right.root.length - left.root.length)[0]?.project || null
 }
 
 export function createQueryScope({ connectionId, profile, requestedRoot, canonicalRoot = null, view = 'ready', issueId = null }) {
@@ -334,6 +364,20 @@ function IssueDetail({ issue, onBack }) {
   })
 }
 
+export async function lookupProjectForCwd(request, cwd, profile) {
+  const response = await request('projects.for_cwd', { cwd, profile })
+  if (response?.project) return response
+
+  try {
+    const listing = await request('projects.list', { profile })
+    if (!Array.isArray(listing?.projects)) return response
+    const project = selectProjectForCwd(listing.projects, response?.cwd || cwd)
+    return project ? { ...response, project } : response
+  } catch {
+    return response
+  }
+}
+
 export function ProjectPane({ ctx, connectionId, profile, project, requestedRoot, visible }) {
   const [view, setView] = useState('ready')
   const [selectedIssueId, setSelectedIssueId] = useState(null)
@@ -500,7 +544,7 @@ function BeadsPane({ ctx }) {
   const projectQuery = useQuery({
     queryKey: ['beads', 'project', connectionId || '', profile || '', cwd || ''],
     enabled: Boolean(connectionId && profile && cwd),
-    queryFn: () => host.request('projects.for_cwd', { cwd, profile }),
+    queryFn: () => lookupProjectForCwd(host.request, cwd, profile),
     refetchOnWindowFocus: true,
     staleTime: 15000
   })
