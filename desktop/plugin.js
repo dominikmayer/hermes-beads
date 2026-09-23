@@ -7,7 +7,6 @@ import {
   PANES_AREA,
   RowButton,
   ScrollArea,
-  SegmentedControl,
   Separator,
   Skeleton,
   fmtDateTime,
@@ -26,7 +25,33 @@ export const VIEW_OPTIONS = Object.freeze([
   { id: 'in_progress', label: 'In progress' },
   { id: 'blocked', label: 'Blocked' }
 ])
+export const DISPLAY_OPTIONS_KEY = 'display-options'
+export const DEFAULT_DISPLAY_OPTIONS = Object.freeze({ showAssignee: false, showUpdatedAt: false })
 const ALWAYS_VISIBLE = { get: () => true, subscribe: callback => (callback(true), () => {}) }
+
+export function normalizeDisplayOptions(value) {
+  const candidate = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+  return {
+    showAssignee: candidate.showAssignee === true,
+    showUpdatedAt: candidate.showUpdatedAt === true
+  }
+}
+
+export function readDisplayOptions(storage) {
+  try {
+    return normalizeDisplayOptions(storage?.get?.(DISPLAY_OPTIONS_KEY, DEFAULT_DISPLAY_OPTIONS))
+  } catch {
+    return normalizeDisplayOptions(DEFAULT_DISPLAY_OPTIONS)
+  }
+}
+
+export function writeDisplayOptions(storage, value) {
+  const normalized = normalizeDisplayOptions(value)
+  try {
+    storage?.set?.(DISPLAY_OPTIONS_KEY, normalized)
+  } catch {}
+  return normalized
+}
 
 export function normalizeAbsolutePath(value) {
   if (typeof value !== 'string') return null
@@ -222,18 +247,71 @@ function PriorityBadge({ priority }) {
   return jsx(Badge, { variant: 'outline', children: priority })
 }
 
-function CountStrip({ counts }) {
+export function CountStrip({ counts, value, onChange }) {
   return jsx('div', {
+    role: 'group',
+    'aria-label': 'Issue views',
     className: 'grid grid-cols-4 gap-1 px-3',
     children: VIEW_OPTIONS.map(option =>
-      jsxs('div', {
-        className: 'rounded-md border border-(--ui-stroke-secondary) px-1.5 py-1 text-center',
+      jsxs('button', {
+        type: 'button',
+        'aria-pressed': value === option.id,
+        onClick: () => onChange(option.id),
+        className: `rounded-md border px-1.5 py-1 text-center ${value === option.id ? 'border-(--ui-accent) bg-(--ui-bg-secondary)' : 'border-(--ui-stroke-secondary)'}`,
         children: [
           jsx('div', { className: 'text-sm font-semibold tabular-nums', children: counts?.[option.id] ?? 0 }),
           jsx('div', { className: 'truncate text-[0.625rem] text-(--ui-text-tertiary)', children: option.label })
         ]
       }, option.id)
     )
+  })
+}
+
+export function DisplayOptions({ open, options, onToggle, onChange }) {
+  return jsxs('div', {
+    className: 'grid justify-items-end gap-2',
+    children: [
+      jsx(Button, {
+        size: 'sm',
+        variant: 'ghost',
+        onClick: onToggle,
+        'aria-expanded': open,
+        'aria-controls': 'beads-display-options',
+        children: 'Options'
+      }),
+      open
+        ? jsxs('div', {
+            id: 'beads-display-options',
+            role: 'group',
+            'aria-label': 'Display options',
+            className: 'grid gap-1 rounded-md border border-(--ui-stroke-secondary) p-2 text-xs',
+            children: [
+              jsxs('label', {
+                className: 'flex items-center gap-2',
+                children: [
+                  jsx('input', {
+                    type: 'checkbox',
+                    checked: options.showAssignee,
+                    onChange: event => onChange('showAssignee', event.target.checked)
+                  }),
+                  jsx('span', { children: 'Assignee / E-mail' })
+                ]
+              }),
+              jsxs('label', {
+                className: 'flex items-center gap-2',
+                children: [
+                  jsx('input', {
+                    type: 'checkbox',
+                    checked: options.showUpdatedAt,
+                    onChange: event => onChange('showUpdatedAt', event.target.checked)
+                  }),
+                  jsx('span', { children: 'Dates' })
+                ]
+              })
+            ]
+          })
+        : null
+    ]
   })
 }
 
@@ -260,7 +338,7 @@ function Warning({ error, onRetry }) {
   })
 }
 
-function IssueRows({ rows, onSelect }) {
+export function IssueRows({ rows, onSelect, displayOptions = DEFAULT_DISPLAY_OPTIONS }) {
   if (!rows.length) return jsx(EmptyState, { title: 'No issues', description: 'This Beads view is empty.' })
   return jsx(ScrollArea, {
     className: 'min-h-0 flex-1',
@@ -285,8 +363,8 @@ function IssueRows({ rows, onSelect }) {
                 children: [
                   jsx('span', { children: issue.id }),
                   issue.type ? jsx('span', { children: issue.type }) : null,
-                  issue.assignee ? jsx('span', { children: issue.assignee }) : null,
-                  issue.updatedAt ? jsx('span', { children: formatDateTime(issue.updatedAt) }) : null
+                  displayOptions.showAssignee && issue.assignee ? jsx('span', { children: issue.assignee }) : null,
+                  displayOptions.showUpdatedAt && issue.updatedAt ? jsx('span', { children: formatDateTime(issue.updatedAt) }) : null
                 ]
               })
             ]
@@ -308,7 +386,7 @@ function DetailSection({ title, value }) {
   })
 }
 
-function IssueDetail({ issue, onBack }) {
+export function IssueDetail({ issue, onBack, displayOptions = DEFAULT_DISPLAY_OPTIONS }) {
   return jsxs('div', {
     className: 'flex min-h-0 flex-1 flex-col',
     children: [
@@ -335,7 +413,8 @@ function IssueDetail({ issue, onBack }) {
                     jsx(PriorityBadge, { priority: issue.priority }),
                     jsx('span', { children: issue.status }),
                     issue.type ? jsx('span', { children: issue.type }) : null,
-                    issue.assignee ? jsx('span', { children: issue.assignee }) : null
+                    displayOptions.showAssignee && issue.assignee ? jsx('span', { children: issue.assignee }) : null,
+                    displayOptions.showUpdatedAt && issue.updatedAt ? jsx('span', { children: formatDateTime(issue.updatedAt) }) : null
                   ]
                 })
               ]
@@ -381,6 +460,8 @@ export async function lookupProjectForCwd(request, cwd, profile) {
 export function ProjectPane({ ctx, connectionId, profile, project, requestedRoot, visible }) {
   const [view, setView] = useState('ready')
   const [selectedIssueId, setSelectedIssueId] = useState(null)
+  const [displayOptions, setDisplayOptions] = useState(() => readDisplayOptions(ctx.storage))
+  const [displayOptionsOpen, setDisplayOptionsOpen] = useState(false)
   const [rowsState, updateRows] = useReducer(retentionReducer, { identity: null, data: null })
   const [detailState, updateDetail] = useReducer(retentionReducer, { identity: null, data: null })
   const identity = `${connectionId}\u0000${profile}\u0000${requestedRoot}`
@@ -448,6 +529,14 @@ export function ProjectPane({ ctx, connectionId, profile, project, requestedRoot
     if (selectedIssueId) detailQuery.refetch()
     else issuesQuery.refetch()
   }
+  const changeView = nextView => {
+    setView(nextView)
+    setSelectedIssueId(null)
+  }
+  const changeDisplayOption = (key, checked) => {
+    const next = writeDisplayOptions(ctx.storage, { ...displayOptions, [key]: checked })
+    setDisplayOptions(next)
+  }
   const refreshing = overviewQuery.isFetching || issuesQuery.isFetching || detailQuery.isFetching
 
   if (overviewQuery.isLoading) return jsx(LoadingRows, {})
@@ -481,31 +570,33 @@ export function ProjectPane({ ctx, connectionId, profile, project, requestedRoot
                   jsx('div', { className: 'truncate text-sm font-semibold', children: overviewQuery.data.project?.name || project.name }),
                   jsxs('div', {
                     className: 'truncate text-[0.6875rem] text-(--ui-text-tertiary)',
-                    children: [overviewQuery.data.project?.repository || basename(canonicalRoot), overviewQuery.data.observedAt ? ` · ${formatDateTime(overviewQuery.data.observedAt)}` : '']
+                    children: [overviewQuery.data.project?.repository || basename(canonicalRoot), displayOptions.showUpdatedAt && overviewQuery.data.observedAt ? ` · ${formatDateTime(overviewQuery.data.observedAt)}` : '']
                   })
                 ]
               }),
-              jsx(Button, {
-                size: 'sm',
-                variant: 'outline',
-                onClick: refresh,
-                disabled: refreshing,
-                children: refreshing ? jsx(GlyphSpinner, {}) : 'Refresh'
+              jsxs('div', {
+                className: 'flex items-center gap-1',
+                children: [
+                  jsx(DisplayOptions, {
+                    open: displayOptionsOpen,
+                    options: displayOptions,
+                    onToggle: () => setDisplayOptionsOpen(open => !open),
+                    onChange: changeDisplayOption
+                  }),
+                  jsx(Button, {
+                    size: 'sm',
+                    variant: 'outline',
+                    onClick: refresh,
+                    disabled: refreshing,
+                    children: refreshing ? jsx(GlyphSpinner, {}) : 'Refresh'
+                  })
+                ]
               })
             ]
-          }),
-          jsx(SegmentedControl, {
-            className: 'w-full',
-            options: VIEW_OPTIONS,
-            value: view,
-            onChange: nextView => {
-              setView(nextView)
-              setSelectedIssueId(null)
-            }
           })
         ]
       }),
-      jsx(CountStrip, { counts: overviewQuery.data.counts }),
+      jsx(CountStrip, { counts: overviewQuery.data.counts, value: view, onChange: changeView }),
       jsx('div', { className: 'py-2', children: jsx(Separator, {}) }),
       overviewQuery.error && overviewQuery.data
         ? jsx(Warning, { error: overviewQuery.error, onRetry: () => overviewQuery.refetch() })
@@ -514,7 +605,7 @@ export function ProjectPane({ ctx, connectionId, profile, project, requestedRoot
       detailQuery.error && detail ? jsx(Warning, { error: detailQuery.error, onRetry: () => detailQuery.refetch() }) : null,
       selectedIssueId
         ? detail
-          ? jsx(IssueDetail, { issue: detail, onBack: () => setSelectedIssueId(null) })
+          ? jsx(IssueDetail, { issue: detail, displayOptions, onBack: () => setSelectedIssueId(null) })
           : detailQuery.error
             ? jsx(ErrorState, {
                 title: 'Issue unavailable',
@@ -523,7 +614,7 @@ export function ProjectPane({ ctx, connectionId, profile, project, requestedRoot
               })
             : jsx(LoadingRows, {})
         : rows
-          ? jsx(IssueRows, { rows, onSelect: issueId => setSelectedIssueId(issueId) })
+          ? jsx(IssueRows, { rows, displayOptions, onSelect: issueId => setSelectedIssueId(issueId) })
           : issuesQuery.error
             ? jsx(ErrorState, {
                 title: 'Issues unavailable',

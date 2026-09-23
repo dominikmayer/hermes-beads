@@ -6,9 +6,16 @@ import plugin, {
   acceptsOverview,
   buildPluginUrl,
   createQueryScope,
+  DEFAULT_DISPLAY_OPTIONS,
+  DisplayOptions,
   detailQueryKey,
+  CountStrip,
+  DISPLAY_OPTIONS_KEY,
+  IssueDetail,
+  IssueRows,
   isPathAncestor,
   issuesQueryKey,
+  normalizeDisplayOptions,
   normalizeAbsolutePath,
   overviewQueryKey,
   parseApiError,
@@ -16,11 +23,13 @@ import plugin, {
   pollingInterval,
   ProjectPane,
   queryEnablement,
+  readDisplayOptions,
   retentionReducer,
   lookupProjectForCwd,
   resolveProjectPath,
   selectProjectForCwd,
-  selectRequestedRoot
+  selectRequestedRoot,
+  writeDisplayOptions
 } from '../desktop/plugin.js'
 import { __queryOptions, __setQueryResult, queryClient } from '@hermes/plugin-sdk'
 import { __flushEffects, __render, __resetHooks } from 'react'
@@ -34,6 +43,22 @@ function findElement(node, name) {
     if (found) return found
   }
   return null
+}
+
+function findElements(node, predicate, results = []) {
+  if (!node || typeof node !== 'object') return results
+  if (predicate(node)) results.push(node)
+  const children = node.props?.children
+  for (const child of Array.isArray(children) ? children : [children]) findElements(child, predicate, results)
+  return results
+}
+
+function textContent(node) {
+  if (node === null || node === undefined || node === false) return ''
+  if (typeof node === 'string' || typeof node === 'number') return String(node)
+  if (Array.isArray(node)) return node.map(textContent).join('')
+  if (typeof node !== 'object') return ''
+  return textContent(node.props?.children)
 }
 
 test('selectRequestedRoot chooses the longest absolute ancestor', () => {
@@ -80,6 +105,71 @@ test('selectProjectForCwd chooses the longest active absolute or tilde root', ()
     { id: 'nested', archived: false, primary_path: '~/workspace/app', folders: [{ path: '~/workspace/app/packages/api' }] }
   ], cwd)
   assert.equal(project?.id, 'nested')
+})
+
+test('display options normalize defaults, partial values, false values, and malformed storage', () => {
+  assert.deepEqual(DEFAULT_DISPLAY_OPTIONS, { showAssignee: false, showUpdatedAt: false })
+  assert.deepEqual(normalizeDisplayOptions(undefined), DEFAULT_DISPLAY_OPTIONS)
+  assert.deepEqual(normalizeDisplayOptions({ showAssignee: true, extra: true }), { showAssignee: true, showUpdatedAt: false })
+  assert.deepEqual(normalizeDisplayOptions({ showAssignee: false, showUpdatedAt: false }), DEFAULT_DISPLAY_OPTIONS)
+  assert.deepEqual(normalizeDisplayOptions('invalid'), DEFAULT_DISPLAY_OPTIONS)
+
+  const reads = []
+  assert.deepEqual(readDisplayOptions({
+    get(key, fallback) {
+      reads.push([key, fallback])
+      return { showUpdatedAt: true }
+    }
+  }), { showAssignee: false, showUpdatedAt: true })
+  assert.equal(reads[0][0], DISPLAY_OPTIONS_KEY)
+  assert.deepEqual(readDisplayOptions({ get: () => { throw new Error('read failed') } }), DEFAULT_DISPLAY_OPTIONS)
+})
+
+test('display options persistence writes normalized values and tolerates storage errors', () => {
+  const writes = []
+  const storage = { set: (key, value) => writes.push([key, value]) }
+  assert.deepEqual(writeDisplayOptions(storage, { showAssignee: true, ignored: true }), { showAssignee: true, showUpdatedAt: false })
+  assert.deepEqual(writes, [[DISPLAY_OPTIONS_KEY, { showAssignee: true, showUpdatedAt: false }]])
+  assert.deepEqual(writeDisplayOptions({ set: () => { throw new Error('write failed') } }, { showUpdatedAt: true }), { showAssignee: false, showUpdatedAt: true })
+})
+
+test('CountStrip is the single accessible view selector and keeps zero-count buttons active', () => {
+  const tree = __render(() => CountStrip({ counts: { ready: 0, open: 2, in_progress: 0, blocked: 1 }, value: 'ready', onChange: () => {} }))
+  const buttons = findElements(tree, node => node.type === 'button')
+  assert.equal(findElement(tree, 'SegmentedControl'), null)
+  assert.equal(buttons.length, 4)
+  assert.equal(buttons[0].props['aria-pressed'], true)
+  assert.equal(buttons[0].props.children[0].props.children, 0)
+  assert.equal(buttons[2].props.children[0].props.children, 0)
+  assert.equal(buttons[2].props.disabled, undefined)
+  buttons[2].props.onClick()
+})
+
+test('DisplayOptions starts closed and exposes native labelled checkboxes when opened', () => {
+  let changed = null
+  let tree = __render(() => DisplayOptions({
+    open: false,
+    options: DEFAULT_DISPLAY_OPTIONS,
+    onToggle: () => {},
+    onChange: (key, value) => { changed = [key, value] }
+  }))
+  const optionButton = findElements(tree, node => node.props?.['aria-expanded'] !== undefined)[0]
+  assert.equal(optionButton.props['aria-expanded'], false)
+  assert.equal(findElements(tree, node => node.type === 'input').length, 0)
+
+  tree = __render(() => DisplayOptions({
+    open: true,
+    options: DEFAULT_DISPLAY_OPTIONS,
+    onToggle: () => {},
+    onChange: (key, value) => { changed = [key, value] }
+  }))
+  assert.equal(findElements(tree, node => node.props?.['aria-expanded'] !== undefined)[0].props['aria-expanded'], true)
+  const group = findElements(tree, node => node.props?.role === 'group' && node.props?.['aria-label'] === 'Display options')
+  assert.equal(group.length, 1)
+  const inputs = findElements(tree, node => node.type === 'input')
+  assert.equal(inputs.length, 2)
+  inputs[0].props.onChange({ target: { checked: true } })
+  assert.deepEqual(changed, ['showAssignee', true])
 })
 
 test('lookupProjectForCwd preserves a normal project response without listing', async () => {
@@ -220,6 +310,131 @@ test('production ProjectPane retains same-root data and clears on canonical-root
   tree = render()
   assert.equal(findElement(tree, 'IssueRows'), null)
   assert.ok(findElement(tree, 'LoadingRows'))
+})
+
+test('metadata options hide assignee and dates by default and reveal them consistently', () => {
+  const issue = {
+    id: 'gt-1',
+    title: 'Issue 1',
+    status: 'open',
+    type: 'task',
+    assignee: 'me@example.com',
+    updatedAt: 'updated-date'
+  }
+  const hiddenRows = __render(() => IssueRows({ rows: [issue], onSelect: () => {} }))
+  assert.doesNotMatch(textContent(hiddenRows), /me@example\.com/)
+  assert.doesNotMatch(textContent(hiddenRows), /updated-date/)
+  const shownRows = __render(() => IssueRows({
+    rows: [issue],
+    onSelect: () => {},
+    displayOptions: { showAssignee: true, showUpdatedAt: true }
+  }))
+  assert.match(textContent(shownRows), /me@example\.com/)
+  assert.match(textContent(shownRows), /updated-date/)
+
+  const hiddenDetail = __render(() => IssueDetail({ issue, onBack: () => {} }))
+  assert.doesNotMatch(textContent(hiddenDetail), /me@example\.com/)
+  assert.doesNotMatch(textContent(hiddenDetail), /updated-date/)
+  const shownDetail = __render(() => IssueDetail({
+    issue,
+    onBack: () => {},
+    displayOptions: { showAssignee: true, showUpdatedAt: true }
+  }))
+  assert.match(textContent(shownDetail), /me@example\.com/)
+  assert.match(textContent(shownDetail), /updated-date/)
+})
+
+test('ProjectPane persists display options, restores them on remount, and hides header dates by default', () => {
+  __resetHooks()
+  const requestedRoot = '/home/hermes/workspace/project'
+  const overviewKey = ['beads', 'overview', 'local', 'developer', requestedRoot]
+  const issuesKey = ['beads', 'issues', 'local', 'developer', requestedRoot, '/canonical', 'ready']
+  const saved = { showAssignee: false, showUpdatedAt: false }
+  const writes = []
+  const storage = {
+    get: (key, fallback) => key === DISPLAY_OPTIONS_KEY ? saved : fallback,
+    set: (key, value) => {
+      writes.push([key, value])
+      Object.assign(saved, value)
+    }
+  }
+  const ctx = { storage, rest: async () => ({}) }
+  const setQueries = () => {
+    __setQueryResult(overviewKey, {
+      data: { requestedRoot, root: '/canonical', available: true, counts: {}, observedAt: 'observed-date', project: { name: 'Project', repository: 'repo' } }
+    })
+    __setQueryResult(issuesKey, { data: { root: '/canonical', issues: [{ id: 'gt-1', title: 'Issue 1', assignee: 'me@example.com' }] } })
+  }
+  const render = () => __render(() => ProjectPane({
+    ctx,
+    connectionId: 'local',
+    profile: 'developer',
+    project: { name: 'Project' },
+    requestedRoot,
+    visible: true
+  }))
+
+  setQueries()
+  let tree = render()
+  __flushEffects()
+  tree = render()
+  assert.equal(writes.length, 0)
+  assert.doesNotMatch(textContent(findElements(tree, node => node.type === 'header')[0]), /observed-date/)
+
+  findElement(tree, 'DisplayOptions').props.onToggle()
+  tree = render()
+  assert.equal(findElement(tree, 'DisplayOptions').props.open, true)
+  const optionsTree = __render(() => DisplayOptions(findElement(tree, 'DisplayOptions').props))
+  const inputs = findElements(optionsTree, node => node.type === 'input')
+  inputs[0].props.onChange({ target: { checked: true } })
+  tree = render()
+  assert.deepEqual(writes, [[DISPLAY_OPTIONS_KEY, { showAssignee: true, showUpdatedAt: false }]])
+  assert.equal(findElement(tree, 'IssueRows').props.displayOptions.showAssignee, true)
+
+  __resetHooks()
+  setQueries()
+  tree = render()
+  __flushEffects()
+  tree = render()
+  assert.equal(findElement(tree, 'IssueRows').props.displayOptions.showAssignee, true)
+})
+
+test('switching views from issue detail returns to the list and clears the detail selection', () => {
+  __resetHooks()
+  const requestedRoot = '/home/hermes/workspace/project'
+  const overviewKey = ['beads', 'overview', 'local', 'developer', requestedRoot]
+  const readyIssuesKey = ['beads', 'issues', 'local', 'developer', requestedRoot, '/canonical', 'ready']
+  const detailKey = ['beads', 'detail', 'local', 'developer', requestedRoot, '/canonical', 'ready', 'gt-1']
+  const blockedIssuesKey = ['beads', 'issues', 'local', 'developer', requestedRoot, '/canonical', 'blocked']
+  const ctx = { storage: { get: (_key, fallback) => fallback, set: () => {} }, rest: async () => ({}) }
+  const render = () => __render(() => ProjectPane({
+    ctx,
+    connectionId: 'local',
+    profile: 'developer',
+    project: { name: 'Project' },
+    requestedRoot,
+    visible: true
+  }))
+  __setQueryResult(overviewKey, { data: { requestedRoot, root: '/canonical', available: true, counts: {}, project: { name: 'Project' } } })
+  __setQueryResult(readyIssuesKey, { data: { root: '/canonical', issues: [{ id: 'gt-1', title: 'Issue 1' }] } })
+  __setQueryResult(detailKey, { data: { root: '/canonical', id: 'gt-1', title: 'Issue 1', status: 'ready' } })
+  __setQueryResult(blockedIssuesKey, { data: { root: '/canonical', issues: [{ id: 'gt-2', title: 'Blocked issue' }] } })
+
+  let tree = render()
+  __flushEffects()
+  tree = render()
+  findElement(tree, 'IssueRows').props.onSelect('gt-1')
+  tree = render()
+  __flushEffects()
+  tree = render()
+  assert.ok(findElement(tree, 'IssueDetail'))
+  findElement(tree, 'CountStrip').props.onChange('blocked')
+  tree = render()
+  __flushEffects()
+  tree = render()
+  assert.equal(findElement(tree, 'IssueDetail'), null)
+  assert.deepEqual(findElement(tree, 'CountStrip').props.value, 'blocked')
+  assert.deepEqual(findElement(tree, 'IssueRows').props.rows, [{ id: 'gt-2', title: 'Blocked issue' }])
 })
 
 test('production ProjectPane explains how to enable a disabled Agent backend', () => {
