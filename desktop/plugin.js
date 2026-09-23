@@ -541,7 +541,11 @@ export default {
       id: 'pane',
       area: PANES_AREA,
       title: 'Beads',
-      data: { placement: 'right', width: '360px' },
+      data: {
+        placement: 'main',
+        dock: { pane: 'workspace', pos: 'right' },
+        width: '360px'
+      },
       render: () => jsx(BeadsPane, { ctx })
     })
     ctx.onDispose(() => queryClient.removeQueries({ queryKey: ['beads'] }))

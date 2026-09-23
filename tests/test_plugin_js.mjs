@@ -175,7 +175,7 @@ test('API errors parse only normalized bodies', () => {
   })
 })
 
-test('plugin registers one right pane and clears Beads queries on dispose', () => {
+test('plugin registers one movable main pane and clears Beads queries on dispose', () => {
   const registrations = []
   const disposers = []
   plugin.register({
@@ -191,7 +191,11 @@ test('plugin registers one right pane and clears Beads queries on dispose', () =
   assert.equal(plugin.defaultEnabled, false)
   assert.equal(registrations.length, 1)
   assert.equal(registrations[0].id, 'pane')
-  assert.deepEqual(registrations[0].data, { placement: 'right', width: '360px' })
+  assert.deepEqual(registrations[0].data, {
+    placement: 'main',
+    dock: { pane: 'workspace', pos: 'right' },
+    width: '360px'
+  })
   assert.equal(disposers.length, 1)
   disposers[0]()
   assert.deepEqual(queryClient.removals.at(-1), { queryKey: ['beads'] })
