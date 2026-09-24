@@ -6,6 +6,7 @@ import {
   GlyphSpinner,
   PANES_AREA,
   RowButton,
+  SearchField,
   ScrollArea,
   Separator,
   Skeleton,
@@ -26,8 +27,88 @@ export const VIEW_OPTIONS = Object.freeze([
   { id: 'blocked', label: 'Blocked' }
 ])
 export const DISPLAY_OPTIONS_KEY = 'display-options'
+export const FILES_DOCK_MIGRATION_KEY = 'files-center-dock-v1'
+export const SEARCH_DEBOUNCE_MS = 250
 export const DEFAULT_DISPLAY_OPTIONS = Object.freeze({ showAssignee: false, showUpdatedAt: false })
 const ALWAYS_VISIBLE = { get: () => true, subscribe: callback => (callback(true), () => {}) }
+
+export function normalizeSearchQuery(value) {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+export function createListNavigation(source) {
+  return { kind: 'list', source }
+}
+
+export function openIssue(navigation, issueId) {
+  return { kind: 'detail', source: navigation.source, issueId }
+}
+
+export function backFromDetail(navigation) {
+  return createListNavigation(navigation.source)
+}
+
+export function listSourceIdentity(source) {
+  return source.kind === 'search'
+    ? `search\u0000${source.previousView}\u0000${source.query}`
+    : `view\u0000${source.view}`
+}
+
+function cycleNodes(issuesById, parentById) {
+  const cyclic = new Set()
+  for (const issue of issuesById.values()) {
+    const path = []
+    const positions = new Map()
+    let current = issue.id
+    while (parentById.has(current)) {
+      if (positions.has(current)) {
+        for (const id of path.slice(positions.get(current))) cyclic.add(id)
+        break
+      }
+      positions.set(current, path.length)
+      path.push(current)
+      current = parentById.get(current)
+    }
+  }
+  return cyclic
+}
+
+export function buildHierarchy(issues, expandedIds = new Set()) {
+  const ordered = Array.isArray(issues) ? issues : []
+  const issuesById = new Map(ordered.map(issue => [issue.id, issue]))
+  const parentById = new Map()
+  for (const issue of ordered) {
+    if (issue.parentId && issue.parentId !== issue.id && issuesById.has(issue.parentId)) {
+      parentById.set(issue.id, issue.parentId)
+    }
+  }
+  const cyclic = cycleNodes(issuesById, parentById)
+  for (const id of cyclic) parentById.delete(id)
+
+  const childrenById = new Map(ordered.map(issue => [issue.id, []]))
+  for (const issue of ordered) {
+    const parentId = parentById.get(issue.id)
+    if (parentId) childrenById.get(parentId).push(issue)
+  }
+
+  const rows = []
+  const visit = (issue, depth) => {
+    const children = childrenById.get(issue.id)
+    const expanded = children.length > 0 && expandedIds.has(issue.id)
+    rows.push({
+      issue,
+      depth,
+      childCount: children.length,
+      expanded,
+      parentPresent: !issue.parentId || issuesById.has(issue.parentId)
+    })
+    if (expanded) for (const child of children) visit(child, depth + 1)
+  }
+  for (const issue of ordered) {
+    if (!parentById.has(issue.id)) visit(issue, 0)
+  }
+  return rows
+}
 
 export function normalizeDisplayOptions(value) {
   const candidate = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
@@ -129,14 +210,15 @@ export function selectProjectForCwd(projects, resolvedCwd) {
     .sort((left, right) => right.root.length - left.root.length)[0]?.project || null
 }
 
-export function createQueryScope({ connectionId, profile, requestedRoot, canonicalRoot = null, view = 'ready', issueId = null }) {
+export function createQueryScope({ connectionId, profile, requestedRoot, canonicalRoot = null, view = 'ready', issueId = null, query = '' }) {
   return {
     connectionId: String(connectionId || ''),
     profile: String(profile || ''),
     requestedRoot: requestedRoot || null,
     canonicalRoot: canonicalRoot || null,
     view,
-    issueId: issueId || null
+    issueId: issueId || null,
+    query: normalizeSearchQuery(query)
   }
 }
 
@@ -169,6 +251,10 @@ export function detailQueryKey(scope) {
   ]
 }
 
+export function searchQueryKey(scope) {
+  return ['beads', 'search', scope.connectionId, scope.profile, scope.requestedRoot, scope.canonicalRoot, scope.query]
+}
+
 export function buildPluginUrl(path, params = {}) {
   const search = new URLSearchParams()
   for (const [key, value] of Object.entries(params)) {
@@ -180,6 +266,7 @@ export function buildPluginUrl(path, params = {}) {
 
 export function pollingInterval(visible, kind) {
   if (!visible) return false
+  if (kind === 'search') return false
   return kind === 'detail' ? 30000 : 15000
 }
 
@@ -203,6 +290,10 @@ export function acceptsOverview(requestedRoot, response) {
 
 export function acceptsCanonicalRoot(canonicalRoot, response) {
   return Boolean(response && typeof response === 'object' && response.root === canonicalRoot)
+}
+
+export function acceptsSearch(canonicalRoot, query, response) {
+  return Boolean(acceptsCanonicalRoot(canonicalRoot, response) && response.query === query)
 }
 
 export function retentionReducer(state, action) {
@@ -338,39 +429,67 @@ function Warning({ error, onRetry }) {
   })
 }
 
-export function IssueRows({ rows, onSelect, displayOptions = DEFAULT_DISPLAY_OPTIONS }) {
+export function IssueRows({
+  rows,
+  onSelect,
+  displayOptions = DEFAULT_DISPLAY_OPTIONS,
+  hierarchical = false,
+  expandedIds = new Set(),
+  onToggle = () => {}
+}) {
   if (!rows.length) return jsx(EmptyState, { title: 'No issues', description: 'This Beads view is empty.' })
+  const projected = hierarchical
+    ? buildHierarchy(rows, expandedIds)
+    : rows.map(issue => ({ issue, depth: 0, childCount: 0, expanded: false, parentPresent: true }))
   return jsx(ScrollArea, {
     className: 'min-h-0 flex-1',
     children: jsx('div', {
       className: 'grid gap-1 p-2',
-      children: rows.map(issue =>
-        jsx(RowButton, {
-          className: 'grid w-full gap-1 rounded-md border border-transparent p-2 text-left hover:border-(--ui-stroke-secondary) hover:bg-(--ui-bg-secondary)',
-          onClick: () => onSelect(issue.id),
-          children: jsxs('div', {
-            className: 'min-w-0',
-            children: [
-              jsxs('div', {
-                className: 'flex items-start gap-2',
+      children: projected.map(row => {
+        const issue = row.issue
+        return jsxs('div', {
+          className: 'flex items-stretch gap-1',
+          style: { paddingInlineStart: `${row.depth * 14}px` },
+          children: [
+            row.childCount > 0
+              ? jsx('button', {
+                  type: 'button',
+                  'aria-label': `${row.expanded ? 'Collapse' : 'Expand'} ${issue.id}`,
+                  'aria-expanded': row.expanded,
+                  onClick: () => onToggle(issue.id),
+                  className: 'w-6 shrink-0 rounded text-xs text-(--ui-text-tertiary) hover:bg-(--ui-bg-secondary)',
+                  children: row.expanded ? '▾' : '▸'
+                })
+              : jsx('span', { className: 'w-6 shrink-0' }),
+            jsx(RowButton, {
+              className: 'grid min-w-0 flex-1 gap-1 rounded-md border border-transparent p-2 text-left hover:border-(--ui-stroke-secondary) hover:bg-(--ui-bg-secondary)',
+              onClick: () => onSelect(issue.id),
+              children: jsxs('div', {
+                className: 'min-w-0',
                 children: [
-                  jsx(PriorityBadge, { priority: issue.priority }),
-                  jsx('span', { className: 'min-w-0 flex-1 text-xs font-medium', children: issue.title })
-                ]
-              }),
-              jsxs('div', {
-                className: 'mt-1 flex flex-wrap gap-x-2 gap-y-1 text-[0.625rem] text-(--ui-text-tertiary)',
-                children: [
-                  jsx('span', { children: issue.id }),
-                  issue.type ? jsx('span', { children: issue.type }) : null,
-                  displayOptions.showAssignee && issue.assignee ? jsx('span', { children: issue.assignee }) : null,
-                  displayOptions.showUpdatedAt && issue.updatedAt ? jsx('span', { children: formatDateTime(issue.updatedAt) }) : null
+                  jsxs('div', {
+                    className: 'flex items-start gap-2',
+                    children: [
+                      jsx(PriorityBadge, { priority: issue.priority }),
+                      jsx('span', { className: 'min-w-0 flex-1 text-xs font-medium', children: issue.title })
+                    ]
+                  }),
+                  jsxs('div', {
+                    className: 'mt-1 flex flex-wrap gap-x-2 gap-y-1 text-[0.625rem] text-(--ui-text-tertiary)',
+                    children: [
+                      jsx('span', { children: issue.id }),
+                      issue.type ? jsx('span', { children: issue.type }) : null,
+                      hierarchical && issue.parentId && !row.parentPresent ? jsx('span', { children: `Parent ${issue.parentId} not in this view` }) : null,
+                      displayOptions.showAssignee && issue.assignee ? jsx('span', { children: issue.assignee }) : null,
+                      displayOptions.showUpdatedAt && issue.updatedAt ? jsx('span', { children: formatDateTime(issue.updatedAt) }) : null
+                    ]
+                  })
                 ]
               })
-            ]
-          })
+            })
+          ]
         }, issue.id)
-      )
+      })
     })
   })
 }
@@ -458,13 +577,36 @@ export async function lookupProjectForCwd(request, cwd, profile) {
 }
 
 export function ProjectPane({ ctx, connectionId, profile, project, requestedRoot, visible }) {
-  const [view, setView] = useState('ready')
-  const [selectedIssueId, setSelectedIssueId] = useState(null)
+  const [navigation, setNavigation] = useState(() => createListNavigation({ kind: 'view', view: 'ready' }))
+  const [searchInput, setSearchInput] = useState('')
+  const [searchQuery, setSearchQuery] = useState('')
   const [displayOptions, setDisplayOptions] = useState(() => readDisplayOptions(ctx.storage))
   const [displayOptionsOpen, setDisplayOptionsOpen] = useState(false)
   const [rowsState, updateRows] = useReducer(retentionReducer, { identity: null, data: null })
   const [detailState, updateDetail] = useReducer(retentionReducer, { identity: null, data: null })
+  const [expansionState, setExpansionState] = useState({ identity: null, ids: new Set() })
   const identity = `${connectionId}\u0000${profile}\u0000${requestedRoot}`
+  const source = navigation.source
+  const view = source.kind === 'search' ? source.previousView : source.view
+  const selectedIssueId = navigation.kind === 'detail' ? navigation.issueId : null
+
+  useEffect(() => {
+    const normalized = normalizeSearchQuery(searchInput)
+    const timer = setTimeout(() => setSearchQuery(normalized), SEARCH_DEBOUNCE_MS)
+    return () => clearTimeout(timer)
+  }, [searchInput])
+
+  useEffect(() => {
+    if (searchQuery) {
+      setNavigation(current => createListNavigation({
+        kind: 'search',
+        query: searchQuery,
+        previousView: current.source.kind === 'search' ? current.source.previousView : current.source.view
+      }))
+    } else if (source.kind === 'search') {
+      setNavigation(createListNavigation({ kind: 'view', view: source.previousView }))
+    }
+  }, [searchQuery])
 
   const baseScope = createQueryScope({ connectionId, profile, requestedRoot, view, issueId: selectedIssueId })
   const overviewQuery = useQuery({
@@ -480,21 +622,42 @@ export function ProjectPane({ ctx, connectionId, profile, project, requestedRoot
     retry: 1
   })
   const canonicalRoot = acceptsOverview(requestedRoot, overviewQuery.data) ? overviewQuery.data.root : null
-  const listIdentity = `${identity}\u0000${canonicalRoot || ''}\u0000${view}`
+  const sourceIdentity = source.kind === 'search' ? `search\u0000${view}\u0000${source.query}` : `view\u0000${view}`
+  const listIdentity = `${identity}\u0000${canonicalRoot || ''}\u0000${sourceIdentity}`
   const detailIdentity = `${listIdentity}\u0000${selectedIssueId || ''}`
   const rows = rowsState.identity === listIdentity ? rowsState.data : null
   const detail = detailState.identity === detailIdentity ? detailState.data : null
-  const scope = createQueryScope({ connectionId, profile, requestedRoot, canonicalRoot, view, issueId: selectedIssueId })
+  const scope = createQueryScope({
+    connectionId,
+    profile,
+    requestedRoot,
+    canonicalRoot,
+    view,
+    issueId: selectedIssueId,
+    query: source.kind === 'search' ? source.query : ''
+  })
   const enabled = queryEnablement({ validRoot: canonicalRoot && overviewQuery.data?.available, selectedIssueId })
   const issuesQuery = useQuery({
     queryKey: issuesQueryKey(scope),
-    enabled: enabled.list,
+    enabled: enabled.list && source.kind === 'view',
     queryFn: async () => {
       const response = await ctx.rest(buildPluginUrl('/issues', { root: canonicalRoot, view }))
       if (!acceptsCanonicalRoot(canonicalRoot, response)) throw new Error('stale_response')
       return response
     },
     refetchInterval: () => pollingInterval(visible, 'list'),
+    refetchOnWindowFocus: true,
+    retry: 1
+  })
+  const searchResult = useQuery({
+    queryKey: searchQueryKey(scope),
+    enabled: enabled.list && source.kind === 'search' && Boolean(source.query),
+    queryFn: async () => {
+      const response = await ctx.rest(buildPluginUrl('/search', { root: canonicalRoot, q: source.query }))
+      if (!acceptsSearch(canonicalRoot, source.query, response)) throw new Error('stale_response')
+      return response
+    },
+    refetchInterval: () => pollingInterval(visible, 'search'),
     refetchOnWindowFocus: true,
     retry: 1
   })
@@ -514,30 +677,46 @@ export function ProjectPane({ ctx, connectionId, profile, project, requestedRoot
   useEffect(() => updateRows({ type: 'select', identity: listIdentity }), [listIdentity])
   useEffect(() => updateDetail({ type: 'select', identity: detailIdentity }), [detailIdentity])
   useEffect(() => {
-    if (issuesQuery.data && acceptsCanonicalRoot(canonicalRoot, issuesQuery.data)) {
-      updateRows({ type: 'succeed', identity: listIdentity, data: issuesQuery.data.issues || [] })
+    const response = source.kind === 'search' ? searchResult.data : issuesQuery.data
+    const accepted = source.kind === 'search'
+      ? acceptsSearch(canonicalRoot, source.query, response)
+      : acceptsCanonicalRoot(canonicalRoot, response)
+    if (response && accepted) {
+      updateRows({ type: 'succeed', identity: listIdentity, data: response.issues || [] })
     }
-  }, [canonicalRoot, issuesQuery.data, listIdentity])
+  }, [canonicalRoot, issuesQuery.data, listIdentity, searchResult.data, source.kind, source.query])
   useEffect(() => {
     if (detailQuery.data && acceptsCanonicalRoot(canonicalRoot, detailQuery.data)) {
       updateDetail({ type: 'succeed', identity: detailIdentity, data: detailQuery.data })
     }
   }, [canonicalRoot, detailIdentity, detailQuery.data])
 
+  const expansionIdentity = `${identity}\u0000${canonicalRoot || ''}\u0000${view}`
+  const expandedIds = expansionState.identity === expansionIdentity ? expansionState.ids : new Set()
+  const toggleExpanded = issueId => {
+    setExpansionState(current => {
+      const ids = current.identity === expansionIdentity ? new Set(current.ids) : new Set()
+      if (ids.has(issueId)) ids.delete(issueId)
+      else ids.add(issueId)
+      return { identity: expansionIdentity, ids }
+    })
+  }
   const refresh = () => {
     overviewQuery.refetch()
     if (selectedIssueId) detailQuery.refetch()
+    else if (source.kind === 'search') searchResult.refetch()
     else issuesQuery.refetch()
   }
   const changeView = nextView => {
-    setView(nextView)
-    setSelectedIssueId(null)
+    setSearchInput('')
+    setSearchQuery('')
+    setNavigation(createListNavigation({ kind: 'view', view: nextView }))
   }
   const changeDisplayOption = (key, checked) => {
     const next = writeDisplayOptions(ctx.storage, { ...displayOptions, [key]: checked })
     setDisplayOptions(next)
   }
-  const refreshing = overviewQuery.isFetching || issuesQuery.isFetching || detailQuery.isFetching
+  const refreshing = overviewQuery.isFetching || issuesQuery.isFetching || searchResult.isFetching || detailQuery.isFetching
 
   if (overviewQuery.isLoading) return jsx(LoadingRows, {})
   if (overviewQuery.error && !overviewQuery.data) {
@@ -593,33 +772,52 @@ export function ProjectPane({ ctx, connectionId, profile, project, requestedRoot
                 ]
               })
             ]
+          }),
+          jsx(SearchField, {
+            'aria-label': 'Search Beads issues',
+            containerClassName: 'w-full',
+            inputClassName: 'w-full',
+            loading: source.kind === 'search' && searchResult.isFetching,
+            onChange: setSearchInput,
+            placeholder: 'Search IDs and issue text',
+            value: searchInput
           })
         ]
       }),
-      jsx(CountStrip, { counts: overviewQuery.data.counts, value: view, onChange: changeView }),
+      source.kind === 'search'
+        ? jsx('div', { className: 'px-3 text-xs text-(--ui-text-tertiary)', children: `${rows?.length ?? 0} search results for “${source.query}”` })
+        : jsx(CountStrip, { counts: overviewQuery.data.counts, value: view, onChange: changeView }),
       jsx('div', { className: 'py-2', children: jsx(Separator, {}) }),
       overviewQuery.error && overviewQuery.data
         ? jsx(Warning, { error: overviewQuery.error, onRetry: () => overviewQuery.refetch() })
         : null,
-      issuesQuery.error && rows ? jsx(Warning, { error: issuesQuery.error, onRetry: () => issuesQuery.refetch() }) : null,
+      source.kind === 'view' && issuesQuery.error && rows ? jsx(Warning, { error: issuesQuery.error, onRetry: () => issuesQuery.refetch() }) : null,
+      source.kind === 'search' && searchResult.error && rows ? jsx(Warning, { error: searchResult.error, onRetry: () => searchResult.refetch() }) : null,
       detailQuery.error && detail ? jsx(Warning, { error: detailQuery.error, onRetry: () => detailQuery.refetch() }) : null,
       selectedIssueId
         ? detail
-          ? jsx(IssueDetail, { issue: detail, displayOptions, onBack: () => setSelectedIssueId(null) })
+          ? jsx(IssueDetail, { issue: detail, displayOptions, onBack: () => setNavigation(createListNavigation(source)) })
           : detailQuery.error
             ? jsx(ErrorState, {
                 title: 'Issue unavailable',
                 description: parseApiError(detailQuery.error).message,
-                children: jsx(Button, { size: 'sm', variant: 'outline', onClick: () => setSelectedIssueId(null), children: 'Back' })
+                children: jsx(Button, { size: 'sm', variant: 'outline', onClick: () => setNavigation(createListNavigation(source)), children: 'Back' })
               })
             : jsx(LoadingRows, {})
         : rows
-          ? jsx(IssueRows, { rows, displayOptions, onSelect: issueId => setSelectedIssueId(issueId) })
-          : issuesQuery.error
+          ? jsx(IssueRows, {
+              rows,
+              displayOptions,
+              hierarchical: source.kind === 'view',
+              expandedIds,
+              onToggle: toggleExpanded,
+              onSelect: issueId => setNavigation(current => openIssue(current, issueId))
+            })
+          : (source.kind === 'search' ? searchResult.error : issuesQuery.error)
             ? jsx(ErrorState, {
                 title: 'Issues unavailable',
-                description: parseApiError(issuesQuery.error).message,
-                children: jsx(Button, { size: 'sm', variant: 'outline', onClick: () => issuesQuery.refetch(), children: 'Retry' })
+                description: parseApiError(source.kind === 'search' ? searchResult.error : issuesQuery.error).message,
+                children: jsx(Button, { size: 'sm', variant: 'outline', onClick: () => source.kind === 'search' ? searchResult.refetch() : issuesQuery.refetch(), children: 'Retry' })
               })
             : jsx(LoadingRows, {})
     ]
@@ -672,17 +870,30 @@ export default {
   name: 'Beads',
   defaultEnabled: false,
   register(ctx) {
+    const migrationComplete = ctx.storage?.get?.(FILES_DOCK_MIGRATION_KEY, false) === true
+    const dock = { pane: 'files', pos: 'center', ...(!migrationComplete ? { enforce: true } : {}) }
     ctx.register({
       id: 'pane',
       area: PANES_AREA,
       title: 'Beads',
       data: {
-        placement: 'main',
-        dock: { pane: 'workspace', pos: 'right' },
+        placement: 'right',
+        dock,
         width: '360px'
       },
       render: () => jsx(BeadsPane, { ctx })
     })
+    if (!migrationComplete) {
+      try {
+        ctx.storage?.set?.(FILES_DOCK_MIGRATION_KEY, true)
+      } catch (error) {
+        console.error('Beads could not persist the Files dock migration.', error)
+        host.notify({
+          kind: 'warning',
+          message: 'Beads could not save its sidebar placement. The pane may move again after restart.'
+        })
+      }
+    }
     ctx.onDispose(() => queryClient.removeQueries({ queryKey: ['beads'] }))
   }
 }

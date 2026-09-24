@@ -234,6 +234,61 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(pid_file.exists())
         self.assert_process_gone(int(pid_file.read_text()))
 
+    def search_executable(self, mode: str) -> tuple[Path, list[Path]]:
+        pid_dir = Path(self.root_dir.name) / f"search-{mode}"
+        pid_dir.mkdir()
+        files = [pid_dir / f"{index}.pid" for index in range(3)]
+        body = f"""
+        import os, pathlib, sys, time
+        args = sys.argv[1:]
+        root = args[args.index('-C') + 1]
+        command = args[args.index(root) + 1:]
+        index = 0 if command[0] == 'search' else (1 if command[1].startswith('--desc-contains=') else 2)
+        directory = pathlib.Path({str(pid_dir)!r})
+        (directory / f'{{index}}.pid').write_text(str(os.getpid()))
+        while len(list(directory.glob('*.pid'))) < 3:
+            time.sleep(0.005)
+        if {mode!r} == 'failure' and index == 0:
+            raise SystemExit(9)
+        time.sleep(30)
+        """
+        return self.executable(body), files
+
+    async def wait_for_pid_files(self, files: list[Path]):
+        for _ in range(200):
+            if all(path.exists() for path in files):
+                return
+            await asyncio.sleep(0.01)
+        self.fail("search subprocesses did not start")
+
+    async def test_search_first_child_failure_cleans_up_all_process_groups(self):
+        executable, files = self.search_executable("failure")
+        with self.assertRaises(api.ApiFailure) as caught:
+            await api.run_search_reads(self.root, "needle", executable=executable, deadline_seconds=3)
+        self.assertEqual(caught.exception.code, "command_failed")
+        await self.wait_for_pid_files(files)
+        for path in files:
+            self.assert_process_gone(int(path.read_text()))
+
+    async def test_search_aggregate_timeout_cleans_up_all_process_groups(self):
+        executable, files = self.search_executable("timeout")
+        with self.assertRaises(api.ApiFailure) as caught:
+            await api.run_search_reads(self.root, "needle", executable=executable, deadline_seconds=0.2)
+        self.assertEqual(caught.exception.code, "search_timeout")
+        await self.wait_for_pid_files(files)
+        for path in files:
+            self.assert_process_gone(int(path.read_text()))
+
+    async def test_search_caller_cancellation_cleans_up_all_process_groups(self):
+        executable, files = self.search_executable("cancel")
+        task = asyncio.create_task(api.run_search_reads(self.root, "needle", executable=executable, deadline_seconds=5))
+        await self.wait_for_pid_files(files)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        for path in files:
+            self.assert_process_gone(int(path.read_text()))
+
     async def test_repeated_escaped_descendant_pipes_leave_no_transport_warnings(self):
         executable = self.executable(
             """
@@ -298,6 +353,88 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 return
             time.sleep(0.01)
         self.fail(f"process {pid} survived cleanup")
+
+
+class ServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_blocked_hydration_merges_only_parent_id_by_exact_id(self):
+        root = Path("/home/hermes/workspace/example")
+        context = api.CommandResult(b'{}', b'', 0)
+        blocked = api.CommandResult(
+            b'[{"id":"gt-2","title":"Blocked 2","status":"blocked","blocked_by":["gt-a"]},'
+            b'{"id":"gt-1","title":"Blocked 1","status":"blocked","blocked_by":["gt-b"]}]',
+            b'',
+            0,
+        )
+        hydrated = api.CommandResult(
+            b'[{"id":"gt-1","title":"Changed","status":"closed","parent":"gt-parent"}]',
+            b'',
+            0,
+        )
+        with mock.patch.object(api, "read_context", new=mock.AsyncMock(return_value={})), mock.patch.object(
+            api,
+            "run_bd",
+            new=mock.AsyncMock(side_effect=[blocked, hydrated]),
+        ) as run:
+            response = await api.load_issues(root, "blocked", "/bd")
+        self.assertEqual([card["id"] for card in response["issues"]], ["gt-2", "gt-1"])
+        self.assertEqual(response["issues"][0]["parentId"], None)
+        self.assertEqual(response["issues"][1]["parentId"], "gt-parent")
+        self.assertEqual(response["issues"][1]["title"], "Blocked 1")
+        self.assertEqual(response["issues"][1]["status"], "blocked")
+        self.assertEqual(response["issues"][1]["blockerIds"], ["gt-b"])
+        self.assertEqual(
+            run.await_args_list[1].args[1],
+            ("list", "--id=gt-2,gt-1", "--limit", "100", "--flat"),
+        )
+
+    async def test_blocked_hydration_rejects_duplicate_and_unexpected_ids(self):
+        root = Path("/home/hermes/workspace/example")
+        blocked = api.CommandResult(b'[{"id":"gt-1","title":"Blocked"}]', b'', 0)
+        for payload in (
+            b'[{"id":"gt-1","title":"One"},{"id":"gt-1","title":"Again"}]',
+            b'[{"id":"gt-other","title":"Other"}]',
+        ):
+            with mock.patch.object(api, "read_context", new=mock.AsyncMock(return_value={})), mock.patch.object(
+                api,
+                "run_bd",
+                new=mock.AsyncMock(side_effect=[blocked, api.CommandResult(payload, b'', 0)]),
+            ):
+                with self.assertRaises(api.ApiFailure) as caught:
+                    await api.load_issues(root, "blocked", "/bd")
+            self.assertEqual(caught.exception.code, "malformed_response")
+
+    async def test_search_validates_context_once_and_uses_three_fixed_command_vectors(self):
+        root = Path("/home/hermes/workspace/example")
+        results = tuple(api.CommandResult(b'[]', b'', 0) for _ in range(3))
+        with mock.patch.object(api, "read_context", new=mock.AsyncMock(return_value={})) as context, mock.patch.object(
+            api,
+            "run_search_reads",
+            new=mock.AsyncMock(return_value=results),
+        ) as reads:
+            response = await api.load_search(root, "--needle", "/bd", deadline_seconds=0.1)
+        context.assert_awaited_once_with(root, "/bd")
+        reads.assert_awaited_once_with(root, "--needle", executable="/bd", deadline_seconds=0.1)
+        self.assertEqual(response["query"], "--needle")
+
+    async def test_search_read_commands_are_exact_and_concurrent(self):
+        root = Path("/home/hermes/workspace/example")
+        started = []
+        release = asyncio.Event()
+
+        async def run(_root, command, **_kwargs):
+            started.append(command)
+            if len(started) == 3:
+                release.set()
+            await release.wait()
+            return api.CommandResult(b'[]', b'', 0)
+
+        with mock.patch.object(api, "run_bd", side_effect=run):
+            await api.run_search_reads(root, "--needle", executable="/bd", deadline_seconds=1)
+        self.assertEqual(started, [
+            ("search", "--query=--needle", "--limit", "100"),
+            ("list", "--desc-contains=--needle", "--limit", "100", "--flat"),
+            ("list", "--notes-contains=--needle", "--limit", "100", "--flat"),
+        ])
 
 
 class BoundaryTests(unittest.TestCase):
@@ -381,6 +518,34 @@ class BoundaryTests(unittest.TestCase):
         with self.assertRaises(api.ApiFailure):
             api.validate_issue_id("../gt--xyz")
 
+    def test_search_query_is_trimmed_bounded_and_keeps_leading_dashes(self):
+        self.assertEqual(api.validate_search_query("  --needle  "), "--needle")
+        for value in (None, "   ", "x" * 201):
+            with self.assertRaises(api.ApiFailure) as caught:
+                api.validate_search_query(value)
+            self.assertEqual(caught.exception.code, "invalid_query")
+
+    def test_search_merge_keeps_command_order_deduplicates_and_collects_match_kinds(self):
+        root = Path("/home/hermes/workspace/example")
+        groups = (
+            ("id_or_title", [{"id": "gt-1", "title": "One"}, {"id": "gt-2", "title": "Two"}]),
+            ("description", [{"id": "gt-2", "title": "Two changed"}, {"id": "gt-3", "title": "Three"}]),
+            ("notes", [{"id": "gt-1", "title": "One"}]),
+        )
+        hits = api.merge_search_results(root, groups)
+        self.assertEqual([hit["id"] for hit in hits], ["gt-1", "gt-2", "gt-3"])
+        self.assertEqual(hits[0]["matchKinds"], ["id_or_title", "notes"])
+        self.assertEqual(hits[1]["matchKinds"], ["id_or_title", "description"])
+        self.assertEqual(hits[1]["title"], "Two")
+
+    def test_search_merge_caps_the_final_result(self):
+        root = Path("/home/hermes/workspace/example")
+        hits = api.merge_search_results(
+            root,
+            (("id_or_title", [{"id": f"gt-{index}", "title": str(index)} for index in range(105)]),),
+        )
+        self.assertEqual(len(hits), 100)
+
     def test_normalization_caps_cards_and_stabilizes_shape(self):
         root = Path("/home/hermes/workspace/example")
         payload = [
@@ -396,6 +561,69 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(len(cards), 100)
         self.assertEqual(cards[1]["blockerIds"], ["gt-0"])
         self.assertEqual(cards[1]["root"], str(root))
+        self.assertIsNone(cards[1]["parentId"])
+
+    def test_card_parent_prefers_direct_fields_and_parses_compact_dependencies_exactly(self):
+        root = Path("/home/hermes/workspace/example")
+        direct = api.normalize_card(
+            {
+                "id": "gt-child",
+                "title": "Child",
+                "parent": "gt-direct",
+                "dependencies": [
+                    {"issue_id": "gt-child", "depends_on_id": "gt-fallback", "type": "parent-child"},
+                ],
+            },
+            root,
+        )
+        fallback = api.normalize_card(
+            {
+                "id": "gt-child",
+                "title": "Child",
+                "dependencies": [
+                    {"issue_id": "other", "depends_on_id": "wrong", "type": "parent-child"},
+                    {"issue_id": "gt-child", "depends_on_id": "gt-parent", "type": "parent-child"},
+                    {"issue_id": "gt-child", "depends_on_id": "gt-blocker", "type": "blocks"},
+                ],
+            },
+            root,
+        )
+        self.assertEqual(direct["parentId"], "gt-direct")
+        self.assertEqual(fallback["parentId"], "gt-parent")
+
+    def test_card_parent_parses_expanded_dependencies_and_ignores_conflicts_and_cycles(self):
+        root = Path("/home/hermes/workspace/example")
+        expanded = api.normalize_card(
+            {
+                "id": "gt-child",
+                "title": "Child",
+                "dependencies": [{"id": "gt-parent", "dependency_type": "parent-child"}],
+            },
+            root,
+        )
+        conflict = api.normalize_card(
+            {
+                "id": "gt-child",
+                "title": "Child",
+                "dependencies": [
+                    {"id": "gt-a", "dependency_type": "parent-child"},
+                    {"id": "gt-b", "dependency_type": "parent-child"},
+                ],
+            },
+            root,
+        )
+        self_parent = api.normalize_card(
+            {
+                "id": "gt-child",
+                "title": "Child",
+                "parent_id": "gt-child",
+                "dependencies": [{"id": "gt-parent", "dependency_type": "parent-child"}],
+            },
+            root,
+        )
+        self.assertEqual(expanded["parentId"], "gt-parent")
+        self.assertIsNone(conflict["parentId"])
+        self.assertIsNone(self_parent["parentId"])
 
     def test_detail_keeps_relations_separate_from_blockers(self):
         root = Path("/home/hermes/workspace/example")
@@ -498,6 +726,18 @@ class HttpTests(unittest.TestCase):
     def test_invalid_issue_id_uses_normalized_error(self):
         response = self.client.get("/issues/bad!", params={"root": self.root})
         self.assert_api_error(response, 400, "invalid_issue_id")
+
+    def test_invalid_search_query_uses_normalized_error(self):
+        response = self.client.get("/search", params={"root": self.root, "q": "   "})
+        self.assert_api_error(response, 400, "invalid_query")
+
+    def test_search_route_normalizes_query_and_mounts_resource(self):
+        expected = {"root": self.root, "query": "needle", "issues": []}
+        with mock.patch.object(api, "load_search", new=mock.AsyncMock(return_value=expected)) as load:
+            response = self.client.get("/search", params={"root": self.root, "q": "  needle  "})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), expected)
+        load.assert_awaited_once_with(Path(self.root), "needle")
 
     def test_routes_preserve_repeated_hyphen_id(self):
         expected = {"root": self.root, "id": "gt--xyz", "title": "ok"}

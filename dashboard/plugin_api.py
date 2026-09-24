@@ -22,6 +22,7 @@ MAX_STREAM_BYTES = 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 12.0
 TERMINATION_GRACE_SECONDS = 0.35
 MAX_ISSUES = 100
+MAX_SEARCH_QUERY_LENGTH = 200
 ISSUE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 VIEW_COMMANDS: Mapping[str, tuple[str, ...]] = {
     "ready": ("ready", "--limit", "100"),
@@ -95,6 +96,15 @@ def validate_view(view: str | None) -> str:
     value = (view or "").strip()
     if value not in VIEW_COMMANDS:
         raise ApiFailure("invalid_view", "The issue view is invalid.", False, 400)
+    return value
+
+
+def validate_search_query(query: str | None) -> str:
+    value = (query or "").strip()
+    if not value:
+        raise ApiFailure("invalid_query", "A search query is required.", False, 400)
+    if len(value) > MAX_SEARCH_QUERY_LENGTH:
+        raise ApiFailure("invalid_query", "The search query is too long.", False, 400)
     return value
 
 
@@ -279,6 +289,32 @@ def _first(mapping: Mapping[str, Any], names: Sequence[str]) -> Any:
     return None
 
 
+def _parent_id(item: Mapping[str, Any], issue_id: str) -> str | None:
+    direct_present = "parent" in item or "parent_id" in item
+    direct = _as_text(item.get("parent")) or _as_text(item.get("parent_id"))
+    if direct_present:
+        return direct if direct != issue_id else None
+
+    candidates: list[str] = []
+    dependencies = item.get("dependencies")
+    if isinstance(dependencies, list):
+        for dependency in dependencies:
+            if not isinstance(dependency, dict):
+                continue
+            relation_type = _as_text(_first(dependency, ("dependency_type", "type")))
+            if relation_type != "parent-child":
+                continue
+            if "depends_on_id" in dependency:
+                if _as_text(dependency.get("issue_id")) != issue_id:
+                    continue
+                candidate = _as_text(dependency.get("depends_on_id"))
+            else:
+                candidate = _as_text(dependency.get("id"))
+            if candidate and candidate != issue_id and candidate not in candidates:
+                candidates.append(candidate)
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def normalize_counts(status: Any) -> dict[str, int]:
     data = _as_dict(status)
     container = data.get("summary") if isinstance(data.get("summary"), dict) else data.get("counts")
@@ -365,6 +401,7 @@ def normalize_card(raw: Any, root: Path) -> dict[str, Any]:
         "assignee": _as_text(_first(item, ("assignee", "owner"))),
         "updatedAt": _as_text(_first(item, ("updated_at", "updatedAt", "modified_at"))),
         "blockerIds": blockers,
+        "parentId": _parent_id(item, issue_id),
     }
 
 
@@ -430,11 +467,63 @@ def normalize_detail(payload: Any, root: Path) -> dict[str, Any]:
             "design": _as_text(item.get("design")),
             "acceptanceCriteria": _as_text(_first(item, ("acceptance_criteria", "acceptanceCriteria"))),
             "notes": _as_text(item.get("notes")),
-            "parentId": _as_text(_first(item, ("parent", "parent_id"))),
             "relations": relations,
         }
     )
     return detail
+
+
+def merge_search_results(root: Path, groups: Sequence[tuple[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for match_kind, payload in groups:
+        for card in normalize_cards(payload, root):
+            existing = merged.get(card["id"])
+            if existing is None:
+                if len(merged) >= MAX_ISSUES:
+                    continue
+                existing = {**card, "matchKinds": []}
+                merged[card["id"]] = existing
+            if match_kind not in existing["matchKinds"]:
+                existing["matchKinds"].append(match_kind)
+    return list(merged.values())
+
+
+def _first_api_failure(group: BaseExceptionGroup) -> ApiFailure | None:
+    for error in group.exceptions:
+        if isinstance(error, ApiFailure):
+            return error
+        if isinstance(error, BaseExceptionGroup):
+            nested = _first_api_failure(error)
+            if nested is not None:
+                return nested
+    return None
+
+
+async def run_search_reads(
+    root: Path,
+    query: str,
+    *,
+    executable: str | Path | None = None,
+    deadline_seconds: float = COMMAND_TIMEOUT_SECONDS,
+) -> tuple[CommandResult, CommandResult, CommandResult]:
+    commands = (
+        ("search", f"--query={query}", "--limit", "100"),
+        ("list", f"--desc-contains={query}", "--limit", "100", "--flat"),
+        ("list", f"--notes-contains={query}", "--limit", "100", "--flat"),
+    )
+    tasks: list[asyncio.Task[CommandResult]] = []
+    try:
+        async with asyncio.timeout(deadline_seconds):
+            async with asyncio.TaskGroup() as group:
+                tasks = [group.create_task(run_bd(root, command, executable=executable)) for command in commands]
+    except TimeoutError:
+        raise ApiFailure("search_timeout", "Beads search did not respond in time.", True, 504)
+    except BaseExceptionGroup as group:
+        failure = _first_api_failure(group)
+        if failure is not None:
+            raise failure
+        raise ApiFailure("command_failed", "Beads could not be searched.", True, 502)
+    return tasks[0].result(), tasks[1].result(), tasks[2].result()
 
 
 async def read_context(root: Path, executable: str | Path | None = None) -> dict[str, Any]:
@@ -473,10 +562,50 @@ async def load_overview(root: Path, requested_root: str, executable: str | Path 
 async def load_issues(root: Path, view: str, executable: str | Path | None = None) -> dict[str, Any]:
     await read_context(root, executable)
     payload = parse_json_output(await run_bd(root, VIEW_COMMANDS[view], executable=executable))
+    cards = normalize_cards(payload, root)
+    if view == "blocked" and cards:
+        issue_ids = [card["id"] for card in cards]
+        hydration_payload = parse_json_output(
+            await run_bd(
+                root,
+                ("list", f"--id={','.join(issue_ids)}", "--limit", "100", "--flat"),
+                executable=executable,
+            )
+        )
+        hydration_cards = normalize_cards(hydration_payload, root)
+        expected = set(issue_ids)
+        hydrated: dict[str, dict[str, Any]] = {}
+        for card in hydration_cards:
+            if card["id"] not in expected or card["id"] in hydrated:
+                raise ApiFailure("malformed_response", "Beads returned invalid blocked issue hydration.", True, 502)
+            hydrated[card["id"]] = card
+        cards = [{**card, "parentId": hydrated.get(card["id"], {}).get("parentId")} for card in cards]
     return {
         "root": str(root),
         "view": view,
-        "issues": normalize_cards(payload, root),
+        "issues": cards,
+        "observedAt": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+async def load_search(
+    root: Path,
+    query: str,
+    executable: str | Path | None = None,
+    *,
+    deadline_seconds: float = COMMAND_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    await read_context(root, executable)
+    results = await run_search_reads(root, query, executable=executable, deadline_seconds=deadline_seconds)
+    groups = (
+        ("id_or_title", parse_json_output(results[0])),
+        ("description", parse_json_output(results[1])),
+        ("notes", parse_json_output(results[2])),
+    )
+    return {
+        "root": str(root),
+        "query": query,
+        "issues": merge_search_results(root, groups),
         "observedAt": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -526,6 +655,21 @@ async def issue(issue_id: str, root: str | None = Query(default=None)) -> dict[s
         canonical = canonicalize_root(root)
         validated_id = validate_issue_id(issue_id)
         return await load_issue(canonical, validated_id)
+    except ApiFailure as failure:
+        raise_http(failure)
+    except Exception:
+        raise_http(ApiFailure("internal_error", "The Beads backend failed.", True, 500))
+
+
+@router.get("/search")
+async def search(
+    root: str | None = Query(default=None),
+    q: str | None = Query(default=None),
+) -> dict[str, Any]:
+    try:
+        canonical = canonicalize_root(root)
+        query = validate_search_query(q)
+        return await load_search(canonical, query)
     except ApiFailure as failure:
         raise_http(failure)
     except Exception:

@@ -17,6 +17,7 @@ export async function load(url, context, nextLoad) {
       source: `
         const runtime = globalThis.__beadsTestRuntime ||= {
           effectDeps: [],
+          effectCleanups: [],
           effects: [],
           hooks: [],
           queries: new Map(),
@@ -28,7 +29,9 @@ export async function load(url, context, nextLoad) {
           Array.isArray(left) && Array.isArray(right) &&
           left.length === right.length && left.every((value, index) => Object.is(value, right[index]))
         export const __resetHooks = () => {
+          runtime.effectCleanups.forEach(cleanup => cleanup?.())
           runtime.effectDeps = []
+          runtime.effectCleanups = []
           runtime.effects = []
           runtime.hooks = []
           runtime.queries = new Map()
@@ -46,11 +49,14 @@ export async function load(url, context, nextLoad) {
         export const __flushEffects = () => {
           const effects = runtime.effects
           runtime.effects = []
-          effects.forEach(effect => effect())
+          effects.forEach(({ effect, index }) => {
+            runtime.effectCleanups[index]?.()
+            runtime.effectCleanups[index] = effect()
+          })
         }
         export const useEffect = (effect, deps) => {
           const index = effectCursor++
-          if (!sameDeps(runtime.effectDeps[index], deps)) runtime.effects.push(effect)
+          if (!sameDeps(runtime.effectDeps[index], deps)) runtime.effects.push({ effect, index })
           runtime.effectDeps[index] = deps
         }
         export const useMemo = fn => fn()
@@ -92,6 +98,7 @@ export async function load(url, context, nextLoad) {
         export const ErrorState = component
         export const GlyphSpinner = component
         export const RowButton = component
+        export const SearchField = component
         export const ScrollArea = component
         export const SegmentedControl = component
         export const Separator = component
@@ -102,6 +109,7 @@ export async function load(url, context, nextLoad) {
         export const host = {
           state: { cwd: atom(''), profile: atom('developer'), connectionId: atom('local') },
           paneVisibility: () => atom(true),
+          notify: () => {},
           request: async () => ({})
         }
         export const queryClient = {
@@ -109,7 +117,7 @@ export async function load(url, context, nextLoad) {
           removeQueries(value) { this.removals.push(value) }
         }
         const runtime = globalThis.__beadsTestRuntime ||= {
-          effectDeps: [], effects: [], hooks: [], queries: new Map(), queryOptions: []
+          effectDeps: [], effectCleanups: [], effects: [], hooks: [], queries: new Map(), queryOptions: []
         }
         export const __setQueryResult = (key, value) => runtime.queries.set(JSON.stringify(key), value)
         export const __queryOptions = () => runtime.queryOptions

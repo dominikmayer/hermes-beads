@@ -1,10 +1,15 @@
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 
 import plugin, {
   acceptsCanonicalRoot,
+  acceptsSearch,
   acceptsOverview,
+  backFromDetail,
+  buildHierarchy,
   buildPluginUrl,
+  createListNavigation,
   createQueryScope,
   DEFAULT_DISPLAY_OPTIONS,
   DisplayOptions,
@@ -15,8 +20,12 @@ import plugin, {
   IssueRows,
   isPathAncestor,
   issuesQueryKey,
+  listSourceIdentity,
+  searchQueryKey,
   normalizeDisplayOptions,
   normalizeAbsolutePath,
+  normalizeSearchQuery,
+  openIssue,
   overviewQueryKey,
   parseApiError,
   pathsEquivalent,
@@ -31,8 +40,15 @@ import plugin, {
   selectRequestedRoot,
   writeDisplayOptions
 } from '../desktop/plugin.js'
-import { __queryOptions, __setQueryResult, queryClient } from '@hermes/plugin-sdk'
+import { __queryOptions, __setQueryResult, host, queryClient } from '@hermes/plugin-sdk'
 import { __flushEffects, __render, __resetHooks } from 'react'
+
+test('desktop entry uses only imports supported by the production runtime loader', async () => {
+  const source = await readFile(new URL('../desktop/plugin.js', import.meta.url), 'utf8')
+  const imports = [...source.matchAll(/\bimport\s+(?:[^'";]+?\s+from\s+)?(['"])([^'"]+)\1/g)]
+    .map(match => match[2])
+  assert.deepEqual(imports, ['@hermes/plugin-sdk', 'react', 'react/jsx-runtime'])
+})
 
 function findElement(node, name) {
   if (!node || typeof node !== 'object') return null
@@ -259,6 +275,45 @@ test('response guards reject stale requested and canonical roots', () => {
   assert.equal(acceptsOverview('/requested', { requestedRoot: '/old', root: '/canonical' }), false)
   assert.equal(acceptsCanonicalRoot('/canonical', { root: '/canonical', issues: [] }), true)
   assert.equal(acceptsCanonicalRoot('/canonical', { root: '/other', issues: [] }), false)
+  assert.equal(acceptsSearch('/canonical', 'needle', { root: '/canonical', query: 'needle' }), true)
+  assert.equal(acceptsSearch('/canonical', 'needle', { root: '/canonical', query: 'old' }), false)
+})
+
+test('hierarchy projection is stable, cycle-safe, and collapse-aware', () => {
+  const issues = [
+    { id: 'child-first', title: 'Child first', parentId: 'parent' },
+    { id: 'parent', title: 'Parent', parentId: null },
+    { id: 'grandchild', title: 'Grandchild', parentId: 'child-first' },
+    { id: 'missing', title: 'Missing parent', parentId: 'outside' },
+    { id: 'self', title: 'Self', parentId: 'self' },
+    { id: 'cycle-a', title: 'Cycle A', parentId: 'cycle-b' },
+    { id: 'cycle-b', title: 'Cycle B', parentId: 'cycle-a' }
+  ]
+  const expanded = new Set(['parent', 'child-first'])
+  const rows = buildHierarchy(issues, expanded)
+  assert.deepEqual(rows.map(row => [row.issue.id, row.depth]), [
+    ['parent', 0], ['child-first', 1], ['grandchild', 2], ['missing', 0], ['self', 0], ['cycle-a', 0], ['cycle-b', 0]
+  ])
+  assert.equal(rows.find(row => row.issue.id === 'missing').parentPresent, false)
+  assert.equal(rows.find(row => row.issue.id === 'parent').childCount, 1)
+  assert.equal(new Set(rows.map(row => row.issue.id)).size, issues.length)
+  assert.deepEqual(buildHierarchy(issues, new Set()).map(row => row.issue.id), ['parent', 'missing', 'self', 'cycle-a', 'cycle-b'])
+})
+
+test('pane navigation keeps the originating list or search source', () => {
+  const searchSource = { kind: 'search', query: 'needle', previousView: 'blocked' }
+  const list = createListNavigation(searchSource)
+  const detail = openIssue(list, 'gt-1')
+  assert.deepEqual(detail, { kind: 'detail', source: searchSource, issueId: 'gt-1' })
+  assert.deepEqual(backFromDetail(detail), list)
+  assert.equal(normalizeSearchQuery('  needle  '), 'needle')
+  assert.equal(listSourceIdentity(searchSource), 'search\u0000blocked\u0000needle')
+})
+
+test('search keys include the full identity and search never interval polls', () => {
+  const scope = createQueryScope({ connectionId: 'local', profile: 'developer', requestedRoot: '/requested', canonicalRoot: '/canonical', query: 'needle' })
+  assert.deepEqual(searchQueryKey(scope), ['beads', 'search', 'local', 'developer', '/requested', '/canonical', 'needle'])
+  assert.equal(pollingInterval(true, 'search'), false)
 })
 
 test('production retention reducer clears on canonical switch and rejects late data', () => {
@@ -342,6 +397,76 @@ test('metadata options hide assignee and dates by default and reveal them consis
   }))
   assert.match(textContent(shownDetail), /me@example\.com/)
   assert.match(textContent(shownDetail), /updated-date/)
+})
+
+test('hierarchy rows use separate accessible disclosure and selection controls', () => {
+  let selected = null
+  let toggled = null
+  const tree = __render(() => IssueRows({
+    rows: [
+      { id: 'parent', title: 'Parent', parentId: null },
+      { id: 'child', title: 'Child', parentId: 'parent' }
+    ],
+    hierarchical: true,
+    expandedIds: new Set(['parent']),
+    onSelect: id => { selected = id },
+    onToggle: id => { toggled = id }
+  }))
+  const disclosure = findElements(tree, node => node.type === 'button' && node.props?.['aria-expanded'] !== undefined)[0]
+  const rows = findElements(tree, node => typeof node.type === 'function' && typeof node.props?.onClick === 'function')
+  assert.equal(disclosure.props['aria-expanded'], true)
+  assert.equal(disclosure.props['aria-label'], 'Collapse parent')
+  disclosure.props.onClick()
+  assert.equal(toggled, 'parent')
+  rows[0].props.onClick()
+  assert.equal(selected, 'parent')
+})
+
+test('ProjectPane debounces native search, replaces counts, and returns from detail to search', async () => {
+  __resetHooks()
+  const requestedRoot = '/home/hermes/workspace/project'
+  const overviewKey = ['beads', 'overview', 'local', 'developer', requestedRoot]
+  const readyKey = ['beads', 'issues', 'local', 'developer', requestedRoot, '/canonical', 'ready']
+  const searchKey = ['beads', 'search', 'local', 'developer', requestedRoot, '/canonical', 'needle']
+  const detailKey = ['beads', 'detail', 'local', 'developer', requestedRoot, '/canonical', 'ready', 'gt-1']
+  __setQueryResult(overviewKey, { data: { requestedRoot, root: '/canonical', available: true, counts: {}, project: { name: 'Project' } } })
+  __setQueryResult(readyKey, { data: { root: '/canonical', issues: [{ id: 'ready', title: 'Ready' }] } })
+  const render = () => __render(() => ProjectPane({
+    ctx: { storage: { get: (_key, fallback) => fallback, set: () => {} }, rest: async () => ({}) },
+    connectionId: 'local',
+    profile: 'developer',
+    project: { name: 'Project' },
+    requestedRoot,
+    visible: true
+  }))
+
+  let tree = render()
+  __flushEffects()
+  tree = render()
+  findElements(tree, node => node.props?.placeholder === 'Search IDs and issue text')[0].props.onChange('  needle  ')
+  tree = render()
+  __flushEffects()
+  assert.equal(__queryOptions().some(options => options.queryKey[1] === 'search' && options.enabled), false)
+  await new Promise(resolve => setTimeout(resolve, 275))
+  tree = render()
+  __flushEffects()
+  __setQueryResult(searchKey, { data: { root: '/canonical', query: 'needle', issues: [{ id: 'gt-1', title: 'Search hit', matchKinds: ['description'] }] } })
+  tree = render()
+  __flushEffects()
+  tree = render()
+  assert.equal(findElement(tree, 'CountStrip'), null)
+  assert.match(textContent(tree), /1 search results for/)
+  assert.equal(findElement(tree, 'IssueRows').props.hierarchical, false)
+
+  __setQueryResult(detailKey, { data: { root: '/canonical', id: 'gt-1', title: 'Search hit', status: 'open' } })
+  findElement(tree, 'IssueRows').props.onSelect('gt-1')
+  tree = render()
+  __flushEffects()
+  tree = render()
+  assert.ok(findElement(tree, 'IssueDetail'))
+  findElement(tree, 'IssueDetail').props.onBack()
+  tree = render()
+  assert.match(textContent(tree), /search results for/)
 })
 
 test('ProjectPane persists display options, restores them on remount, and hides header dates by default', () => {
@@ -468,10 +593,15 @@ test('API errors parse only normalized bodies', () => {
   })
 })
 
-test('plugin registers one movable main pane and clears Beads queries on dispose', () => {
+test('plugin registers one Files-center right pane, migrates once, and clears Beads queries on dispose', () => {
   const registrations = []
   const disposers = []
+  const writes = []
   plugin.register({
+    storage: {
+      get: (_key, fallback) => fallback,
+      set: (key, value) => writes.push([key, value])
+    },
     register(contribution) {
       registrations.push(contribution)
       return () => {}
@@ -485,11 +615,40 @@ test('plugin registers one movable main pane and clears Beads queries on dispose
   assert.equal(registrations.length, 1)
   assert.equal(registrations[0].id, 'pane')
   assert.deepEqual(registrations[0].data, {
-    placement: 'main',
-    dock: { pane: 'workspace', pos: 'right' },
+    placement: 'right',
+    dock: { pane: 'files', pos: 'center', enforce: true },
     width: '360px'
   })
+  assert.deepEqual(writes, [['files-center-dock-v1', true]])
   assert.equal(disposers.length, 1)
   disposers[0]()
   assert.deepEqual(queryClient.removals.at(-1), { queryKey: ['beads'] })
+
+  const migrated = []
+  plugin.register({
+    storage: { get: () => true, set: () => assert.fail('migration should not be rewritten') },
+    register: contribution => migrated.push(contribution),
+    onDispose: () => {}
+  })
+  assert.deepEqual(migrated[0].data.dock, { pane: 'files', pos: 'center' })
+
+  const notifications = []
+  const originalNotify = host.notify
+  const originalConsoleError = console.error
+  host.notify = value => notifications.push(value)
+  console.error = () => {}
+  try {
+    plugin.register({
+      storage: { get: () => false, set: () => { throw new Error('storage failed') } },
+      register: () => {},
+      onDispose: () => {}
+    })
+  } finally {
+    host.notify = originalNotify
+    console.error = originalConsoleError
+  }
+  assert.deepEqual(notifications, [{
+    kind: 'warning',
+    message: 'Beads could not save its sidebar placement. The pane may move again after restart.'
+  }])
 })
