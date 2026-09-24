@@ -5,7 +5,7 @@ Hermes Beads is a read-only unified plugin for browsing a Beads project from Her
 ## Features
 
 - Four bounded issue views with counts and manual refresh.
-- Parent-child rows with local expand and collapse controls.
+- Always-visible parent-child rows with compact indentation and guide lines.
 - Cycle-safe display. Malformed parent cycles do not hide issues.
 - Search across issue IDs, titles, descriptions, and notes.
 - Existing issue detail with descriptions, design notes, acceptance criteria, blockers, and relations.
@@ -46,7 +46,7 @@ The Desktop half is materialized into the app-level desktop plugin directory. Ed
 
 Open a Hermes Desktop Project inside a Beads repository. The pane resolves the deepest active Hermes Project folder that contains the current working directory. The backend canonicalizes that folder and rejects roots outside `/home/hermes/workspace`, redirected Beads contexts, and Beads data directories that escape the project.
 
-Select a status count to load that view. Parent issues appear above children only when both issues are present in the current bounded response. A child whose parent is outside the response remains visible as a root and shows the missing parent ID. Expand and collapse state stays local to the current connection, profile, requested root, canonical root, and view.
+Select a status count to load that view. Every issue in the bounded response stays visible. Parent issues appear above their descendants when both issues are present. Compact indentation and a guide line show each descendant's depth without squeezing deep hierarchies out of the pane. A child whose parent is outside the response remains visible as a root and shows the missing parent ID.
 
 Type in the native search field to search active issues. The pane waits briefly before sending the query. Search performs three fixed reads:
 

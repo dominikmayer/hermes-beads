@@ -73,7 +73,7 @@ function cycleNodes(issuesById, parentById) {
   return cyclic
 }
 
-export function buildHierarchy(issues, expandedIds = new Set()) {
+export function buildHierarchy(issues) {
   const ordered = Array.isArray(issues) ? issues : []
   const issuesById = new Map(ordered.map(issue => [issue.id, issue]))
   const parentById = new Map()
@@ -94,20 +94,21 @@ export function buildHierarchy(issues, expandedIds = new Set()) {
   const rows = []
   const visit = (issue, depth) => {
     const children = childrenById.get(issue.id)
-    const expanded = children.length > 0 && expandedIds.has(issue.id)
     rows.push({
       issue,
       depth,
-      childCount: children.length,
-      expanded,
       parentPresent: !issue.parentId || issuesById.has(issue.parentId)
     })
-    if (expanded) for (const child of children) visit(child, depth + 1)
+    for (const child of children) visit(child, depth + 1)
   }
   for (const issue of ordered) {
     if (!parentById.has(issue.id)) visit(issue, 0)
   }
   return rows
+}
+
+export function hierarchyIndent(depth) {
+  return Math.min(depth, 6) * 10
 }
 
 export function normalizeDisplayOptions(value) {
@@ -433,40 +434,43 @@ export function IssueRows({
   rows,
   onSelect,
   displayOptions = DEFAULT_DISPLAY_OPTIONS,
-  hierarchical = false,
-  expandedIds = new Set(),
-  onToggle = () => {}
+  hierarchical = false
 }) {
   if (!rows.length) return jsx(EmptyState, { title: 'No issues', description: 'This Beads view is empty.' })
   const projected = hierarchical
-    ? buildHierarchy(rows, expandedIds)
-    : rows.map(issue => ({ issue, depth: 0, childCount: 0, expanded: false, parentPresent: true }))
+    ? buildHierarchy(rows)
+    : rows.map(issue => ({ issue, depth: 0, parentPresent: true }))
   return jsx(ScrollArea, {
     className: 'min-h-0 flex-1',
     children: jsx('div', {
+      role: 'list',
       className: 'grid gap-1 p-2',
       children: projected.map(row => {
         const issue = row.issue
+        const indent = hierarchyIndent(row.depth)
         return jsxs('div', {
-          className: 'flex items-stretch gap-1',
-          style: { paddingInlineStart: `${row.depth * 14}px` },
+          role: 'listitem',
+          className: 'flex items-stretch',
           children: [
-            row.childCount > 0
-              ? jsx('button', {
-                  type: 'button',
-                  'aria-label': `${row.expanded ? 'Collapse' : 'Expand'} ${issue.id}`,
-                  'aria-expanded': row.expanded,
-                  onClick: () => onToggle(issue.id),
-                  className: 'w-6 shrink-0 rounded text-xs text-(--ui-text-tertiary) hover:bg-(--ui-bg-secondary)',
-                  children: row.expanded ? '▾' : '▸'
+            hierarchical && row.depth > 0
+              ? jsx('span', {
+                  'aria-hidden': true,
+                  className: 'shrink-0 self-stretch opacity-60',
+                  style: {
+                    inlineSize: `${indent}px`,
+                    borderInlineEnd: '1px solid var(--ui-stroke-secondary)'
+                  }
                 })
-              : jsx('span', { className: 'w-6 shrink-0' }),
+              : null,
             jsx(RowButton, {
               className: 'grid min-w-0 flex-1 gap-1 rounded-md border border-transparent p-2 text-left hover:border-(--ui-stroke-secondary) hover:bg-(--ui-bg-secondary)',
               onClick: () => onSelect(issue.id),
               children: jsxs('div', {
                 className: 'min-w-0',
                 children: [
+                  hierarchical && issue.parentId && row.parentPresent
+                    ? jsx('span', { className: 'sr-only', children: `Parent ${issue.parentId}. ` })
+                    : null,
                   jsxs('div', {
                     className: 'flex items-start gap-2',
                     children: [
@@ -584,7 +588,6 @@ export function ProjectPane({ ctx, connectionId, profile, project, requestedRoot
   const [displayOptionsOpen, setDisplayOptionsOpen] = useState(false)
   const [rowsState, updateRows] = useReducer(retentionReducer, { identity: null, data: null })
   const [detailState, updateDetail] = useReducer(retentionReducer, { identity: null, data: null })
-  const [expansionState, setExpansionState] = useState({ identity: null, ids: new Set() })
   const identity = `${connectionId}\u0000${profile}\u0000${requestedRoot}`
   const source = navigation.source
   const view = source.kind === 'search' ? source.previousView : source.view
@@ -691,16 +694,6 @@ export function ProjectPane({ ctx, connectionId, profile, project, requestedRoot
     }
   }, [canonicalRoot, detailIdentity, detailQuery.data])
 
-  const expansionIdentity = `${identity}\u0000${canonicalRoot || ''}\u0000${view}`
-  const expandedIds = expansionState.identity === expansionIdentity ? expansionState.ids : new Set()
-  const toggleExpanded = issueId => {
-    setExpansionState(current => {
-      const ids = current.identity === expansionIdentity ? new Set(current.ids) : new Set()
-      if (ids.has(issueId)) ids.delete(issueId)
-      else ids.add(issueId)
-      return { identity: expansionIdentity, ids }
-    })
-  }
   const refresh = () => {
     overviewQuery.refetch()
     if (selectedIssueId) detailQuery.refetch()
@@ -809,8 +802,6 @@ export function ProjectPane({ ctx, connectionId, profile, project, requestedRoot
               rows,
               displayOptions,
               hierarchical: source.kind === 'view',
-              expandedIds,
-              onToggle: toggleExpanded,
               onSelect: issueId => setNavigation(current => openIssue(current, issueId))
             })
           : (source.kind === 'search' ? searchResult.error : issuesQuery.error)

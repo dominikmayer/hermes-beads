@@ -16,6 +16,7 @@ import plugin, {
   detailQueryKey,
   CountStrip,
   DISPLAY_OPTIONS_KEY,
+  hierarchyIndent,
   IssueDetail,
   IssueRows,
   isPathAncestor,
@@ -279,25 +280,37 @@ test('response guards reject stale requested and canonical roots', () => {
   assert.equal(acceptsSearch('/canonical', 'needle', { root: '/canonical', query: 'old' }), false)
 })
 
-test('hierarchy projection is stable, cycle-safe, and collapse-aware', () => {
+test('hierarchy projection returns every issue once in stable depth-first order', () => {
   const issues = [
     { id: 'child-first', title: 'Child first', parentId: 'parent' },
     { id: 'parent', title: 'Parent', parentId: null },
+    { id: 'sibling', title: 'Sibling', parentId: 'parent' },
     { id: 'grandchild', title: 'Grandchild', parentId: 'child-first' },
     { id: 'missing', title: 'Missing parent', parentId: 'outside' },
     { id: 'self', title: 'Self', parentId: 'self' },
     { id: 'cycle-a', title: 'Cycle A', parentId: 'cycle-b' },
     { id: 'cycle-b', title: 'Cycle B', parentId: 'cycle-a' }
   ]
-  const expanded = new Set(['parent', 'child-first'])
-  const rows = buildHierarchy(issues, expanded)
+  const rows = buildHierarchy(issues)
   assert.deepEqual(rows.map(row => [row.issue.id, row.depth]), [
-    ['parent', 0], ['child-first', 1], ['grandchild', 2], ['missing', 0], ['self', 0], ['cycle-a', 0], ['cycle-b', 0]
+    ['parent', 0],
+    ['child-first', 1],
+    ['grandchild', 2],
+    ['sibling', 1],
+    ['missing', 0],
+    ['self', 0],
+    ['cycle-a', 0],
+    ['cycle-b', 0]
   ])
   assert.equal(rows.find(row => row.issue.id === 'missing').parentPresent, false)
-  assert.equal(rows.find(row => row.issue.id === 'parent').childCount, 1)
+  assert.deepEqual(Object.keys(rows[0]).sort(), ['depth', 'issue', 'parentPresent'])
   assert.equal(new Set(rows.map(row => row.issue.id)).size, issues.length)
-  assert.deepEqual(buildHierarchy(issues, new Set()).map(row => row.issue.id), ['parent', 'missing', 'self', 'cycle-a', 'cycle-b'])
+  assert.equal(rows.length, issues.length)
+  assert.deepEqual(buildHierarchy(null), [])
+})
+
+test('hierarchy indentation increases by ten pixels and caps after depth six', () => {
+  assert.deepEqual([0, 1, 2, 6, 7, 99].map(hierarchyIndent), [0, 10, 20, 60, 60, 60])
 })
 
 test('pane navigation keeps the originating list or search source', () => {
@@ -399,27 +412,66 @@ test('metadata options hide assignee and dates by default and reveal them consis
   assert.match(textContent(shownDetail), /updated-date/)
 })
 
-test('hierarchy rows use separate accessible disclosure and selection controls', () => {
+test('hierarchy rows are always visible list items with one selectable control and decorative guides', () => {
   let selected = null
-  let toggled = null
   const tree = __render(() => IssueRows({
     rows: [
       { id: 'parent', title: 'Parent', parentId: null },
-      { id: 'child', title: 'Child', parentId: 'parent' }
+      { id: 'child', title: 'Child', parentId: 'parent' },
+      { id: 'grandchild', title: 'Grandchild', parentId: 'child' },
+      { id: 'missing', title: 'Missing parent', parentId: 'outside' },
+      { id: 'self', title: 'Self parent', parentId: 'self' },
+      { id: 'cycle-a', title: 'Cycle A', parentId: 'cycle-b' },
+      { id: 'cycle-b', title: 'Cycle B', parentId: 'cycle-a' }
     ],
     hierarchical: true,
-    expandedIds: new Set(['parent']),
-    onSelect: id => { selected = id },
-    onToggle: id => { toggled = id }
+    onSelect: id => { selected = id }
   }))
-  const disclosure = findElements(tree, node => node.type === 'button' && node.props?.['aria-expanded'] !== undefined)[0]
-  const rows = findElements(tree, node => typeof node.type === 'function' && typeof node.props?.onClick === 'function')
-  assert.equal(disclosure.props['aria-expanded'], true)
-  assert.equal(disclosure.props['aria-label'], 'Collapse parent')
-  disclosure.props.onClick()
-  assert.equal(toggled, 'parent')
+  const lists = findElements(tree, node => node.props?.role === 'list')
+  const items = findElements(tree, node => node.props?.role === 'listitem')
+  const rows = findElements(tree, node => typeof node.type === 'function' && node.props?.className?.includes('text-left'))
+  const guides = findElements(tree, node => node.props?.['aria-hidden'] === true)
+  assert.equal(lists.length, 1)
+  assert.equal(items.length, 7)
+  assert.equal(rows.length, 7)
+  assert.equal(findElements(tree, node => node.props?.['aria-expanded'] !== undefined).length, 0)
+  assert.equal(findElements(tree, node => node.type === 'button').length, 0)
+  assert.deepEqual(guides.map(guide => guide.props.style.inlineSize), ['10px', '20px'])
+  for (const guide of guides) {
+    assert.match(guide.props.style.borderInlineEnd, /var\(--ui-stroke-secondary\)/)
+  }
+  assert.match(textContent(rows[1]), /Parent parent/)
+  assert.match(textContent(rows[2]), /Parent child/)
+  assert.match(rows[1].props.children.props.children[0].props.className, /sr-only/)
+  assert.match(textContent(rows[3]), /Parent outside not in this view/)
+  assert.equal(rows[3].props.children.props.children[0], null)
+  assert.match(textContent(rows[4]), /Parent self/)
+  assert.match(textContent(rows[5]), /Parent cycle-b/)
+  assert.match(textContent(rows[6]), /Parent cycle-a/)
   rows[0].props.onClick()
   assert.equal(selected, 'parent')
+})
+
+test('search rows stay flat in source order without hierarchy guides or parent context', () => {
+  const tree = __render(() => IssueRows({
+    rows: [
+      { id: 'child', title: 'Child', parentId: 'parent' },
+      { id: 'parent', title: 'Parent', parentId: null }
+    ],
+    hierarchical: false,
+    onSelect: () => {}
+  }))
+  const items = findElements(tree, node => node.props?.role === 'listitem')
+  assert.deepEqual(items.map(textContent), ['Childchild', 'Parentparent'])
+  assert.equal(findElements(tree, node => node.props?.['aria-hidden'] === true).length, 0)
+  assert.doesNotMatch(textContent(tree), /Parent parent|not in this view/)
+})
+
+test('hierarchy expansion state and controls are absent', async () => {
+  const source = await readFile(new URL('../desktop/plugin.js', import.meta.url), 'utf8')
+  const issueRowsSource = source.slice(source.indexOf('export function IssueRows'), source.indexOf('function DetailSection'))
+  assert.doesNotMatch(source, /expandedIds|expansionState|expansionIdentity|toggleExpanded|childCount/)
+  assert.doesNotMatch(issueRowsSource, /aria-expanded|onToggle|Expand|Collapse/)
 })
 
 test('ProjectPane debounces native search, replaces counts, and returns from detail to search', async () => {
